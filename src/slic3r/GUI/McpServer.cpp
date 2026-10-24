@@ -4,8 +4,10 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <thread>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/log/trivial.hpp>
@@ -13,8 +15,14 @@
 #include "nlohmann/json.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r_version.h"
+#include "libslic3r/Print.hpp"
 #include "GUI_App.hpp"
+#include "GUI_ObjectList.hpp"
+#include "GLToolbar.hpp"
+#include "MainFrame.hpp"
+#include "PartPlate.hpp"
 #include "Plater.hpp"
+#include "Jobs/Job.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -44,35 +52,201 @@ static json run_on_ui_thread(const std::atomic_bool &running, std::function<json
     return future.get();
 }
 
+// Arrange and slicing finish through UI events, so poll their state on the UI thread.
+static void wait_until(const std::atomic_bool &running, std::function<bool()> done, int timeout_s, const std::string &what)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    while (!run_on_ui_thread(running, [done] { return json(done()); }).get<bool>()) {
+        if (std::chrono::steady_clock::now() > deadline)
+            throw std::runtime_error(what + " did not finish within " + std::to_string(timeout_s) + " s");
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
 static json to_json(const Vec3d &v) { return {v.x(), v.y(), v.z()}; }
 
-static json get_scene(const json &)
+static json object_json(size_t idx)
 {
-    json objects = json::array();
-    for (const ModelObject *obj : wxGetApp().plater()->model().objects) {
-        json instances = json::array();
-        for (size_t i = 0; i < obj->instances.size(); ++i) {
-            BoundingBoxf3 bb = obj->instance_bounding_box(i);
-            instances.push_back({{"min", to_json(bb.min)}, {"max", to_json(bb.max)}, {"size", to_json(bb.size())}});
-        }
-        objects.push_back({{"name", obj->name}, {"instances", instances}});
+    const ModelObject *obj       = wxGetApp().plater()->model().objects[idx];
+    json               instances = json::array();
+    for (size_t i = 0; i < obj->instances.size(); ++i) {
+        BoundingBoxf3 bb = obj->instance_bounding_box(i);
+        instances.push_back({{"min", to_json(bb.min)}, {"max", to_json(bb.max)}, {"size", to_json(bb.size())}});
     }
-    return {{"units", "mm"}, {"objects", objects}};
+    return {{"index", idx}, {"name", obj->name}, {"instances", instances}};
+}
+
+static json get_scene(const json &, const std::atomic_bool &running)
+{
+    return run_on_ui_thread(running, [] {
+        json objects = json::array();
+        for (size_t i = 0; i < wxGetApp().plater()->model().objects.size(); ++i)
+            objects.push_back(object_json(i));
+        return json{{"units", "mm"}, {"objects", objects}};
+    });
+}
+
+static json add_shape(const json &args, const std::atomic_bool &running)
+{
+    const std::string shape = args.value("shape", "");
+    const json        size  = args.value("size", json());
+    if (!size.is_array() || size.size() != 3 ||
+        !std::all_of(size.begin(), size.end(), [](const json &v) { return v.is_number() && v.get<double>() > 0.; }))
+        throw std::invalid_argument("size must be [x, y, z] in mm, all > 0");
+    const Vec3f s(size[0].get<float>(), size[1].get<float>(), size[2].get<float>());
+
+    TriangleMesh mesh;
+    if (shape == "box")
+        mesh = make_cube(s.x(), s.y(), s.z());
+    else if (shape == "cylinder")
+        mesh = make_cylinder(0.5, 1.);
+    else if (shape == "sphere")
+        mesh = make_sphere(0.5, PI / 90.);
+    else
+        throw std::invalid_argument("shape must be box, cylinder or sphere");
+    if (shape != "box")
+        mesh.scale(s);
+
+    const std::string name = args.value("name", shape);
+    return run_on_ui_thread(running, [mesh, name] {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Add Primitive");
+        wxGetApp().obj_list()->load_mesh_object(mesh, from_u8(name));
+        wxGetApp().mainframe->update_title();
+        return object_json(wxGetApp().plater()->model().objects.size() - 1);
+    });
+}
+
+static json import_model(const json &args, const std::atomic_bool &running)
+{
+    const boost::filesystem::path path(args.value("path", ""));
+    if (!path.is_absolute() || !boost::filesystem::is_regular_file(path))
+        throw std::invalid_argument("path must be an absolute path to an existing file");
+
+    return run_on_ui_thread(running, [path] {
+        // Model only: a 3MF's printer and filament settings must not replace the user's presets.
+        std::vector<size_t> idxs = wxGetApp().plater()->load_files(std::vector<std::string>{path.string()}, LoadStrategy::LoadModel);
+        if (idxs.empty())
+            throw std::runtime_error("Could not load " + path.string());
+        json objects = json::array();
+        for (size_t i : idxs)
+            objects.push_back(object_json(i));
+        return json{{"objects", objects}};
+    });
+}
+
+static json delete_objects(const json &args, const std::atomic_bool &running)
+{
+    const json names = args.value("names", json());
+    if (!names.is_null() && !(names.is_array() && std::all_of(names.begin(), names.end(), [](const json &n) { return n.is_string(); })))
+        throw std::invalid_argument("names must be an array of object names");
+
+    return run_on_ui_thread(running, [names] {
+        Plater *plater = wxGetApp().plater();
+        if (names.is_null()) {
+            plater->delete_all_objects_from_model();
+            return json{{"deleted", "all"}};
+        }
+        const ModelObjectPtrs &objects = plater->model().objects;
+        std::vector<size_t>    idxs;
+        for (const json &name : names) {
+            auto it = std::find_if(objects.begin(), objects.end(), [&name](const ModelObject *o) { return o->name == name.get<std::string>(); });
+            if (it == objects.end())
+                throw std::invalid_argument("No object named " + name.get<std::string>());
+            idxs.push_back(it - objects.begin());
+        }
+        // Highest index first, so the remaining indices stay valid.
+        std::sort(idxs.rbegin(), idxs.rend());
+        idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+        Plater::TakeSnapshot snapshot(plater, "Delete Objects");
+        for (size_t idx : idxs) {
+            // Plater::remove() keeps the object list in sync; unlike delete_object_from_model() it asks nothing about cut objects.
+            if (objects[idx]->is_cut())
+                wxGetApp().obj_list()->invalidate_cut_info_for_object(int(idx));
+            plater->remove(idx);
+        }
+        return json{{"deleted", names}};
+    });
+}
+
+static json arrange(const json &, const std::atomic_bool &running)
+{
+    run_on_ui_thread(running, [] {
+        Plater *plater = wxGetApp().plater();
+        // Claims m_arrange_running; ArrangeJob::finalize() clears it once the new positions are applied.
+        if (plater->is_any_job_running() || !plater->last_arrange_job_is_finished())
+            throw std::runtime_error("Another arrange or orient job is running");
+        plater->set_prepare_state(Job::PREPARE_STATE_DEFAULT);
+        plater->arrange();
+        return json();
+    });
+    wait_until(running, [] { return !wxGetApp().plater()->m_arrange_running.load(); }, 120, "Arrange");
+    return get_scene(json(), running);
+}
+
+static json slice(const json &, const std::atomic_bool &running)
+{
+    run_on_ui_thread(running, [] {
+        Plater *plater = wxGetApp().plater();
+        plater->exit_gizmo();
+        plater->update(true, true);
+        bool model_fits = false, validate_error = false;
+        plater->validate_current_plate(model_fits, validate_error);
+        if (!model_fits)
+            throw std::runtime_error("Some objects are outside the plate; call arrange first");
+        if (validate_error)
+            throw std::runtime_error("The plate is not valid for slicing, see the notifications in BambuStudio");
+        // Same handler as the Slice button, without the button's first-use pop-ups.
+        SimpleEvent evt(EVT_GLTOOLBAR_SLICE_PLATE);
+        plater->GetEventHandler()->ProcessEvent(evt);
+        return json();
+    });
+    wait_until(running, [] { return !wxGetApp().plater()->is_background_process_slicing(); }, 600, "Slicing");
+
+    return run_on_ui_thread(running, [] {
+        PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+        if (!plate->is_slice_result_valid())
+            throw std::runtime_error("Slicing failed, see the notifications in BambuStudio");
+        const PrintStatistics &stats = plate->fff_print()->print_statistics();
+        return json{{"print_time", stats.estimated_normal_print_time},
+                    {"filament_g", stats.total_weight},
+                    {"filament_m", stats.total_used_filament / 1000.}};
+    });
 }
 
 struct McpTool
 {
-    const char                     *name;
-    const char                     *description;
-    json                            input_schema;
-    std::function<json(const json &)> run;
+    const char                                                *name;
+    const char                                                *description;
+    json                                                       input_schema;
+    std::function<json(const json &, const std::atomic_bool &)> run;
 };
+
+static const json NO_ARGS = {{"type", "object"}, {"properties", json::object()}};
 
 static const std::vector<McpTool> &tools()
 {
     static const std::vector<McpTool> tools = {
         {"get_scene", "List the objects on the build plate, with the bounding box (min, max, size in mm) of each instance.",
-         {{"type", "object"}, {"properties", json::object()}}, get_scene},
+         NO_ARGS, get_scene},
+        {"add_shape", "Add a box, cylinder or sphere scaled to the given size (mm). It is placed on a free spot of the plate.",
+         {{"type", "object"},
+          {"properties",
+           {{"shape", {{"type", "string"}, {"enum", json::array({"box", "cylinder", "sphere"})}}},
+            {"size", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3},
+                      {"description", "[x, y, z] in mm; a cylinder or sphere with x != y is elliptic"}}},
+            {"name", {{"type", "string"}}}}},
+          {"required", json::array({"shape", "size"})}},
+         add_shape},
+        {"import_model", "Load a model file (STL, 3MF, OBJ, STEP...) onto the plate. Only the geometry is loaded, not printer settings.",
+         {{"type", "object"},
+          {"properties", {{"path", {{"type", "string"}, {"description", "Absolute path"}}}}},
+          {"required", json::array({"path"})}},
+         import_model},
+        {"delete_objects", "Delete objects by name (the first object with each name). Without names, clear the plate. Undoable with Ctrl+Z.",
+         {{"type", "object"}, {"properties", {{"names", {{"type", "array"}, {"items", {{"type", "string"}}}}}}}},
+         delete_objects},
+        {"arrange", "Arrange all objects on the plate and return the new scene.", NO_ARGS, arrange},
+        {"slice", "Slice the current plate with the selected presets. Returns print time and filament use.", NO_ARGS, slice},
     };
     return tools;
 }
@@ -121,8 +295,10 @@ static json handle_rpc(const json &req, const std::atomic_bool &running)
         if (tool == tools().end())
             return rpc_error(id, -32602, "Unknown tool: " + name);
         const json args = params.contains("arguments") ? params["arguments"] : json::object();
+        if (!args.is_object())
+            return rpc_error(id, -32602, "arguments must be an object");
         try {
-            return rpc_result(id, tool_result(run_on_ui_thread(running, [tool, args] { return tool->run(args); }).dump(2), false));
+            return rpc_result(id, tool_result(tool->run(args, running).dump(2), false));
         } catch (const std::exception &e) {
             return rpc_result(id, tool_result(e.what(), true));
         }
