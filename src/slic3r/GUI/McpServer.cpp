@@ -12,7 +12,7 @@
 
 #include "nlohmann/json.hpp"
 #include "libslic3r/Model.hpp"
-#include "libslic3r/libslic3r_version.h"
+#include "libslic3r_version.h"
 #include "GUI_App.hpp"
 #include "Plater.hpp"
 
