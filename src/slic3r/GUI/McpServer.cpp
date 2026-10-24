@@ -3,12 +3,16 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <future>
+#include <sstream>
 #include <thread>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/process.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/core/detail/base64.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -16,6 +20,9 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r_version.h"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/GCode/ThumbnailData.hpp"
+#include "libslic3r/miniz_extension.hpp"
+#include "GLCanvas3D.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GLToolbar.hpp"
@@ -86,6 +93,17 @@ static json get_scene(const json &, const std::atomic_bool &running)
     });
 }
 
+// Adds the mesh as a new object on a free spot of the plate.
+static json add_mesh_object(const std::atomic_bool &running, const TriangleMesh &mesh, const std::string &name)
+{
+    return run_on_ui_thread(running, [mesh, name] {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Add Primitive");
+        wxGetApp().obj_list()->load_mesh_object(mesh, from_u8(name));
+        wxGetApp().mainframe->update_title();
+        return object_json(wxGetApp().plater()->model().objects.size() - 1);
+    });
+}
+
 static json add_shape(const json &args, const std::atomic_bool &running)
 {
     const std::string shape = args.value("shape", "");
@@ -107,12 +125,83 @@ static json add_shape(const json &args, const std::atomic_bool &running)
     if (shape != "box")
         mesh.scale(s);
 
-    const std::string name = args.value("name", shape);
-    return run_on_ui_thread(running, [mesh, name] {
-        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Add Primitive");
-        wxGetApp().obj_list()->load_mesh_object(mesh, from_u8(name));
-        wxGetApp().mainframe->update_title();
-        return object_json(wxGetApp().plater()->model().objects.size() - 1);
+    return add_mesh_object(running, mesh, args.value("name", shape));
+}
+
+// shortcut: needs openscad on PATH, add a setting for its location if that is not enough.
+static json render_openscad(const json &args, const std::atomic_bool &running)
+{
+    namespace fs = boost::filesystem;
+    namespace bp = boost::process;
+
+    const std::string code = args.value("code", "");
+    if (code.empty())
+        throw std::invalid_argument("code is empty");
+    const fs::path openscad = bp::search_path("openscad");
+    if (openscad.empty())
+        throw std::runtime_error("OpenSCAD is not installed (on Debian/Ubuntu: sudo apt install openscad)");
+
+    const fs::path dir = fs::temp_directory_path() / fs::unique_path("bambu-mcp-%%%%-%%%%-%%%%");
+    fs::create_directories(dir);
+    std::shared_ptr<void> remove_dir(nullptr, [dir](void *) { boost::system::error_code ec; fs::remove_all(dir, ec); });
+    const fs::path scad = dir / "model.scad", stl = dir / "model.stl", log = dir / "openscad.log";
+    std::ofstream(scad.string()) << code;
+
+    bp::child  child(openscad, "-o", stl.string(), scad.string(), bp::std_out > bp::null, bp::std_err > log);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (child.running()) {
+        if (!running || std::chrono::steady_clock::now() > deadline) {
+            child.terminate();
+            throw std::runtime_error(running ? "OpenSCAD did not finish within 120 s" : "BambuStudio is shutting down");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    child.wait();
+
+    std::stringstream output;
+    output << std::ifstream(log.string()).rdbuf();
+    TriangleMesh mesh;
+    if (child.exit_code() != 0 || !mesh.ReadSTLFile(stl.string().c_str(), true) || mesh.empty())
+        throw std::runtime_error("OpenSCAD failed:\n" + output.str());
+
+    json result = add_mesh_object(running, mesh, args.value("name", "openscad"));
+    result["openscad_output"] = output.str(); // echo() and warnings, useful for debugging the code
+    return result;
+}
+
+// Returns an MCP tool result (not plain JSON) so the client receives an image.
+static json get_view(const json &args, const std::atomic_bool &running)
+{
+    static const std::map<std::string, Camera::ViewAngleType> views = {
+        {"iso", Camera::ViewAngleType::Iso}, {"top", Camera::ViewAngleType::Top},   {"front", Camera::ViewAngleType::Front},
+        {"left", Camera::ViewAngleType::Left}, {"right", Camera::ViewAngleType::Right}, {"rear", Camera::ViewAngleType::Rear}};
+    auto view = views.find(args.value("view", "iso"));
+    if (view == views.end())
+        throw std::invalid_argument("view must be iso, top, front, left, right or rear");
+    const unsigned int size = args.value("size", 512);
+    if (size < 64 || size > 2048)
+        throw std::invalid_argument("size must be between 64 and 2048");
+
+    return run_on_ui_thread(running, [angle = view->second, size] {
+        Plater *plater = wxGetApp().plater();
+        // Framed on the objects (use_plate_box = false) so small parts are not lost on a big plate.
+        const ThumbnailsParams params{{}, false, true, true, false, plater->get_partplate_list().get_curr_plate_index(), false};
+        ThumbnailData          data;
+        plater->canvas3D()->render_thumbnail(data, size, size, params, Camera::EType::Ortho, angle);
+        if (!data.is_valid())
+            throw std::runtime_error("Rendering failed");
+
+        size_t png_size = 0;
+        void  *png      = tdefl_write_image_to_png_file_in_memory_ex(data.pixels.data(), data.width, data.height, 4, &png_size, MZ_DEFAULT_LEVEL, 1);
+        if (png == nullptr)
+            throw std::runtime_error("PNG encoding failed");
+        std::string base64(boost::beast::detail::base64::encoded_size(png_size), '\0');
+        base64.resize(boost::beast::detail::base64::encode(base64.data(), png, png_size));
+        mz_free(png);
+
+        json content = json::array();
+        content.push_back({{"type", "image"}, {"data", base64}, {"mimeType", "image/png"}});
+        return json{{"content", content}, {"isError", false}};
     });
 }
 
@@ -237,6 +326,19 @@ static const std::vector<McpTool> &tools()
             {"name", {{"type", "string"}}}}},
           {"required", json::array({"shape", "size"})}},
          add_shape},
+        {"render_openscad",
+         "Render OpenSCAD code to a mesh and add it as one object on a free spot of the plate. Units are mm, Z is up. "
+         "Use this for any shape add_shape cannot make, and build multi-part parts (e.g. a tray with walls) as one model with union().",
+         {{"type", "object"},
+          {"properties", {{"code", {{"type", "string"}, {"description", "OpenSCAD source"}}}, {"name", {{"type", "string"}}}}},
+          {"required", json::array({"code"})}},
+         render_openscad},
+        {"get_view", "Render a picture of the objects on the current plate (orthographic), to check what was built.",
+         {{"type", "object"},
+          {"properties",
+           {{"view", {{"type", "string"}, {"enum", json::array({"iso", "top", "front", "left", "right", "rear"})}, {"default", "iso"}}},
+            {"size", {{"type", "integer"}, {"description", "Image width and height in pixels, 64-2048"}, {"default", 512}}}}}},
+         get_view},
         {"import_model", "Load a model file (STL, 3MF, OBJ, STEP...) onto the plate. Only the geometry is loaded, not printer settings.",
          {{"type", "object"},
           {"properties", {{"path", {{"type", "string"}, {"description", "Absolute path"}}}}},
@@ -298,7 +400,8 @@ static json handle_rpc(const json &req, const std::atomic_bool &running)
         if (!args.is_object())
             return rpc_error(id, -32602, "arguments must be an object");
         try {
-            return rpc_result(id, tool_result(tool->run(args, running).dump(2), false));
+            const json out = tool->run(args, running);
+            return rpc_result(id, out.contains("content") ? out : tool_result(out.dump(2), false));
         } catch (const std::exception &e) {
             return rpc_result(id, tool_result(e.what(), true));
         }
