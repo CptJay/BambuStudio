@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bambu": {
+      "type": "http",
+      "url": "http://localhost:13619/mcp"
+    }
+  }
+}
