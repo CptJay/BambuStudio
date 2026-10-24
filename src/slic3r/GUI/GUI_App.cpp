@@ -116,6 +116,7 @@
 #include "KBShortcutsDialog.hpp"
 #include "DownloadProgressDialog.hpp"
 #include "HttpServer.hpp"
+#include "McpServer.hpp"
 
 #include "BitmapCache.hpp"
 #include "Notebook.hpp"
@@ -190,6 +191,8 @@ namespace Slic3r {
 namespace GUI {
 
 class MainFrame;
+
+static McpServer s_mcp_server;
 
 void start_ping_test()
 {
@@ -2927,6 +2930,8 @@ int GUI_App::OnExit()
 
     Slic3r::HelioQuery::shutdown_background_requests();
 
+    s_mcp_server.stop();
+
     stop_sync_user_preset();
 
     // The check_cert worker also runs the startup device-region query; join it
@@ -3654,6 +3659,7 @@ bool GUI_App::on_init_inner()
 #endif
     mainframe->Show(true);
     BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    s_mcp_server.start();
     perf_mark("Main window shown");
 
 //#if BBL_HAS_FIRST_PAGE
