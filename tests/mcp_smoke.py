@@ -3,6 +3,7 @@
 
 Usage: start BambuStudio with an empty plate, then run  python3 tests/mcp_smoke.py
 Exits non-zero on the first tool that crashes the app, errors unexpectedly or returns something wrong.
+Afterwards BambuStudio's current project is a deleted temp file: start a new project (File > New) before saving your work.
 """
 import json
 import shutil
@@ -14,7 +15,7 @@ from pathlib import Path
 URL = "http://127.0.0.1:13619/mcp"
 TOOLS = {"get_scene", "add_shape", "render_openscad", "get_view", "import_model", "delete_objects", "add_text",
          "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode",
-         "get_settings", "set_settings", "select_process_preset", "undo"}
+         "get_settings", "set_settings", "select_process_preset", "undo", "save_project", "open_project"}
 
 
 def fail(message):
@@ -66,6 +67,13 @@ def main():
         call("add_text", {"name": "smoke box", "text": "UP", "mode": "emboss", "position": [100, 85]})
         call("add_text", {"name": "smoke box", "text": "X", "font": "No Such Font 123"}, expect_error=True)
         call("duplicate_object", {"name": "smoke box", "copies": 1})
+        # Names stay unique, since every tool finds objects by name.
+        call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "twin"})
+        call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "twin"})
+        call("duplicate_object", {"name": "twin"})
+        names = [o["name"] for o in call("get_scene")["objects"]]
+        check(len(names) == len(set(names)) and {"twin", "twin 2", "twin 3"} <= set(names), f"duplicate names: {names}")
+        call("delete_objects", {"names": ["twin", "twin 2", "twin 3"]})
 
         # Settings: only per-object changes and a re-select of the current preset, so the user's presets stay untouched.
         process = call("get_settings")["presets"]["process"]
@@ -110,12 +118,24 @@ def main():
             call("export_gcode", {"path": str(tmp / name)})
             check((tmp / name).stat().st_size > 0, f"export_gcode wrote an empty {name}")
 
+        project = str(tmp / "smoke.3mf")
+        call("save_project", {"path": project})
+        call("save_project", {"path": project}, expect_error=True)
+        reopened = call("open_project", {"path": project})
+        check(any(o["name"] == "smoke box" for o in reopened["objects"]), f"open_project lost objects: {reopened}")
+        call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "unsaved"})
+        call("open_project", {"path": project}, expect_error=True)
+        call("delete_objects", {"names": ["unsaved"]})
+        # Not tested here: slice refusing a project with post_process scripts. Opening such a project leaves its
+        # script in the presets, and tools cannot discard that, so the test would leave the app unsafe.
+
         call("delete_objects", {"names": ["nothing by this name"]}, expect_error=True)
         call("delete_objects", {"names": ["smoke box 2"]})
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         call("delete_objects")
     print("All MCP tools work.")
+    print("Start a new project in BambuStudio (File > New) before saving your own work: the test left a deleted temp file as the current project.")
 
 
 if __name__ == "__main__":
