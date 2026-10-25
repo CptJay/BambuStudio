@@ -26,6 +26,8 @@
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/miniz_extension.hpp"
 #include "GLCanvas3D.hpp"
+#include "Selection.hpp"
+#include "ObjectDataViewModel.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GLToolbar.hpp"
@@ -226,6 +228,99 @@ static json import_model(const json &args, const std::atomic_bool &running)
     });
 }
 
+// Index of the first object with this name. UI thread only.
+static size_t find_object(const std::string &name)
+{
+    const ModelObjectPtrs &objects = wxGetApp().plater()->model().objects;
+    auto it = std::find_if(objects.begin(), objects.end(), [&name](const ModelObject *o) { return o->name == name; });
+    if (it == objects.end())
+        throw std::invalid_argument("No object named " + name);
+    return it - objects.begin();
+}
+
+// Reads an optional [x, y, z] number array argument.
+static std::optional<Vec3d> vec3_arg(const json &args, const char *key)
+{
+    if (!args.contains(key))
+        return std::nullopt;
+    const json &v = args[key];
+    if (!v.is_array() || v.size() != 3 || !std::all_of(v.begin(), v.end(), [](const json &n) { return n.is_number(); }))
+        throw std::invalid_argument(std::string(key) + " must be [x, y, z]");
+    return Vec3d(v[0].get<double>(), v[1].get<double>(), v[2].get<double>());
+}
+
+static json transform_object(const json &args, const std::atomic_bool &running)
+{
+    const std::string name   = args.value("name", "");
+    const auto        rotate = vec3_arg(args, "rotate");
+    const auto        scale  = vec3_arg(args, "scale");
+    std::optional<Vec2d> position;
+    if (args.contains("position")) {
+        const json &p = args["position"];
+        if (!p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number())
+            throw std::invalid_argument("position must be [x, y]");
+        position = Vec2d(p[0].get<double>(), p[1].get<double>());
+    }
+    if (scale && (scale->array() <= 0.).any())
+        throw std::invalid_argument("scale factors must be > 0");
+    if (!rotate && !scale && !position)
+        throw std::invalid_argument("give at least one of position, rotate, scale");
+
+    return run_on_ui_thread(running, [name, rotate, scale, position] {
+        Plater        *plater   = wxGetApp().plater();
+        const size_t   idx      = find_object(name);
+        ModelObject   *obj      = plater->model().objects[idx];
+        ModelInstance *instance = obj->instances[0];
+        Plater::TakeSnapshot snapshot(plater, "Move Object");
+
+        // Scale and rotate first: they change the bounding box the position is measured on.
+        if (scale)
+            instance->set_scaling_factor(instance->get_scaling_factor().cwiseProduct(*scale));
+        if (rotate) {
+            const Vec3d r = *rotate * PI / 180.;
+            instance->rotate((Eigen::AngleAxisd(r.z(), Vec3d::UnitZ()) * Eigen::AngleAxisd(r.y(), Vec3d::UnitY()) *
+                              Eigen::AngleAxisd(r.x(), Vec3d::UnitX())).toRotationMatrix());
+        }
+        obj->invalidate_bounding_box();
+        if (position) {
+            const Vec3d center = obj->instance_bounding_box(0).center();
+            instance->set_offset(instance->get_offset() + Vec3d(position->x() - center.x(), position->y() - center.y(), 0.));
+        }
+        // changed_object() keeps a partly sunk object sunk (the app's sinking feature), so put it on the bed first.
+        obj->ensure_on_bed(false);
+        plater->changed_object(*obj);
+        return object_json(idx);
+    });
+}
+
+static json duplicate_object(const json &args, const std::atomic_bool &running)
+{
+    const std::string name   = args.value("name", "");
+    const int         copies = args.value("copies", 1);
+    if (copies < 1 || copies > 100)
+        throw std::invalid_argument("copies must be between 1 and 100");
+
+    return run_on_ui_thread(running, [name, copies] {
+        Plater      *plater = wxGetApp().plater();
+        const size_t idx    = find_object(name);
+        const size_t first  = plater->model().objects.size();
+        // The app's own Clone: copies keep the original's settings and go on free spots of the plate.
+        Selection &selection = plater->canvas3D()->get_selection();
+        selection.add_object(unsigned(idx), true);
+        selection.clone(copies);
+
+        // Unique names, so later tool calls can tell the copies apart.
+        json objects = json::array();
+        for (size_t i = first; i < plater->model().objects.size(); ++i) {
+            ModelObject *copy = plater->model().objects[i];
+            copy->name        = name + " " + std::to_string(i - first + 2);
+            wxGetApp().obj_list()->GetModel()->SetName(from_u8(copy->name), wxGetApp().obj_list()->GetModel()->GetItemById(int(i)));
+            objects.push_back(object_json(i));
+        }
+        return json{{"objects", objects}};
+    });
+}
+
 static json delete_objects(const json &args, const std::atomic_bool &running)
 {
     const json names = args.value("names", json());
@@ -240,12 +335,8 @@ static json delete_objects(const json &args, const std::atomic_bool &running)
         }
         const ModelObjectPtrs &objects = plater->model().objects;
         std::vector<size_t>    idxs;
-        for (const json &name : names) {
-            auto it = std::find_if(objects.begin(), objects.end(), [&name](const ModelObject *o) { return o->name == name.get<std::string>(); });
-            if (it == objects.end())
-                throw std::invalid_argument("No object named " + name.get<std::string>());
-            idxs.push_back(it - objects.begin());
-        }
+        for (const json &name : names)
+            idxs.push_back(find_object(name.get<std::string>()));
         // Highest index first, so the remaining indices stay valid.
         std::sort(idxs.rbegin(), idxs.rend());
         idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
@@ -387,6 +478,24 @@ static const std::vector<McpTool> &tools()
         {"delete_objects", "Delete objects by name (the first object with each name). Without names, clear the plate. Undoable with Ctrl+Z.",
          {{"type", "object"}, {"properties", {{"names", {{"type", "array"}, {"items", {{"type", "string"}}}}}}}},
          delete_objects},
+        {"transform_object",
+         "Move, rotate and/or scale an object, then drop it onto the bed. Order: scale, rotate, then position.",
+         {{"type", "object"},
+          {"properties",
+           {{"name", {{"type", "string"}}},
+            {"position", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 2}, {"maxItems", 2},
+                          {"description", "[x, y] in mm: where the center of the object's bounding box goes on the plate"}}},
+            {"rotate", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3},
+                        {"description", "[x, y, z] degrees, added to the current rotation, around the plate axes"}}},
+            {"scale", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3},
+                       {"description", "[x, y, z] factors multiplied with the current scale, along the object's own axes"}}}}},
+          {"required", json::array({"name"})}},
+         transform_object},
+        {"duplicate_object", "Make copies of an object, placed on free spots. Copies are named \"<name> 2\", \"<name> 3\"...",
+         {{"type", "object"},
+          {"properties", {{"name", {{"type", "string"}}}, {"copies", {{"type", "integer"}, {"default", 1}}}}},
+          {"required", json::array({"name"})}},
+         duplicate_object},
         {"arrange", "Arrange all objects on the plate and return the new scene.", NO_ARGS, arrange},
         {"slice", "Slice the current plate with the selected presets. Returns print time and filament use.", NO_ARGS, slice},
         {"export_gcode",
