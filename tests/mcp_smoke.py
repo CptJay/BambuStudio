@@ -14,7 +14,7 @@ from pathlib import Path
 URL = "http://127.0.0.1:13619/mcp"
 TOOLS = {"get_scene", "add_shape", "render_openscad", "get_view", "import_model", "delete_objects", "add_text",
          "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode",
-         "get_settings", "set_settings", "select_process_preset"}
+         "get_settings", "set_settings", "select_process_preset", "undo"}
 
 
 def fail(message):
@@ -86,6 +86,12 @@ def main():
         call("import_model", {"path": str(stl)})
         if shutil.which("openscad"):
             call("render_openscad", {"code": "cylinder(h = 10, d = 15);", "name": "smoke cylinder"})
+            # A cube floating above another one: slicing must report it, so a broken warnings list can't pass as [].
+            call("render_openscad", {"code": "cube(10); translate([0, 0, 25]) cube(10);", "name": "smoke floating"})
+            warnings = call("slice")["warnings"]
+            check(any(w.get("object") == "smoke floating" or "smoke floating" in w["message"] for w in warnings),
+                  f"no warning for the floating cube: {warnings}")
+            call("delete_objects", {"names": ["smoke floating"]})
         else:
             print("skip render_openscad (openscad not installed)")
 
@@ -94,7 +100,12 @@ def main():
 
         call("arrange")
         stats = call("slice")
-        check(stats["filament_g"] > 0, "slice used no filament")
+        check(stats["filament_g"] > 0 and isinstance(stats["warnings"], list), f"slice result {stats}")
+        # Undo right after slicing: the app is on the Preview tab then.
+        call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "undo me"})
+        call("slice")
+        undone = call("undo")
+        check(undone["undone"] == "Add Primitive" and all(o["name"] != "undo me" for o in undone["objects"]), f"undo {undone}")
         for name in ("plate.gcode", "plate.gcode.3mf"):
             call("export_gcode", {"path": str(tmp / name)})
             check((tmp / name).stat().st_size > 0, f"export_gcode wrote an empty {name}")
