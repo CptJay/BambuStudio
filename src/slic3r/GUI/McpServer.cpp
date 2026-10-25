@@ -32,6 +32,7 @@
 #include "libslic3r/miniz_extension.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
+#include "BackgroundSlicingProcess.hpp"
 #include "Tab.hpp"
 #include "GUI_Factories.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -602,6 +603,29 @@ static json delete_objects(const json &args, const std::atomic_bool &running)
     });
 }
 
+static json undo(const json &, const std::atomic_bool &running)
+{
+    // The app only undoes in the 3D editor tab, and slice leaves it on the Preview tab.
+    // The switch completes in later UI events, so undo in a separate step.
+    run_on_ui_thread(running, [] {
+        wxGetApp().mainframe->select_tab(size_t(MainFrame::tp3DEditor));
+        wxGetApp().plater()->select_view_3D("3D");
+        return json();
+    });
+    const json undone = run_on_ui_thread(running, [] {
+        Plater *plater = wxGetApp().plater();
+        if (!plater->can_undo())
+            throw std::runtime_error("Nothing to undo");
+        std::string name;
+        plater->undo_redo_topmost_string_getter(true, name);
+        plater->undo();
+        return json(name);
+    });
+    json result      = get_scene(json(), running);
+    result["undone"] = undone;
+    return result;
+}
+
 static json arrange(const json &, const std::atomic_bool &running)
 {
     run_on_ui_thread(running, [] {
@@ -617,6 +641,35 @@ static json arrange(const json &, const std::atomic_bool &running)
     return get_scene(json(), running);
 }
 
+// The app only shows a slicing error as a notification, so McpServer::start() records the last one here. UI thread only.
+static std::string last_slicing_error;
+
+// Current warnings of the finished slice (e.g. floating regions, missing supports), from the print and from each object.
+static json slicing_warnings(const Print &print)
+{
+    json warnings = json::array();
+    auto add      = [&warnings](const PrintStateBase::StateWithWarnings &state, const std::string &object) {
+        for (const PrintStateBase::Warning &w : state.warnings)
+            // Several slicing steps can raise the same warning.
+            if (w.current && std::none_of(warnings.begin(), warnings.end(), [&w](const json &e) { return e["message"] == w.message; })) {
+                json entry = {{"message", w.message}, {"critical", w.level == PrintStateBase::WarningLevel::CRITICAL}};
+                if (!object.empty())
+                    entry["object"] = object;
+                warnings.push_back(entry);
+            }
+    };
+    for (int step = 0; step < psCount; ++step)
+        add(print.step_state_with_warnings(PrintStep(step)), "");
+    for (const PrintObject *obj : print.objects())
+        for (int step = 0; step < posCount; ++step)
+            add(obj->step_state_with_warnings(PrintObjectStep(step)), obj->model_object()->name);
+    StringObjectException check_warning;
+    print.validate(&check_warning);
+    if (!check_warning.string.empty())
+        warnings.push_back({{"message", check_warning.string}, {"critical", false}});
+    return warnings;
+}
+
 static json slice(const json &, const std::atomic_bool &running)
 {
     run_on_ui_thread(running, [] {
@@ -626,9 +679,12 @@ static json slice(const json &, const std::atomic_bool &running)
         bool model_fits = false, validate_error = false;
         plater->validate_current_plate(model_fits, validate_error);
         if (!model_fits)
-            throw std::runtime_error("Some objects are outside the plate; call arrange first");
-        if (validate_error)
-            throw std::runtime_error("The plate is not valid for slicing, see the notifications in BambuStudio");
+            throw std::runtime_error("Some objects do not fit the printer: outside the plate (call arrange) or taller than the build height");
+        if (validate_error) {
+            const std::string why = plater->get_partplate_list().get_curr_plate()->fff_print()->validate().string;
+            throw std::runtime_error("The plate cannot be sliced: " + (why.empty() ? "see the notifications in BambuStudio" : why));
+        }
+        last_slicing_error.clear();
         // Same handler as the Slice button, without the button's first-use pop-ups.
         SimpleEvent evt(EVT_GLTOOLBAR_SLICE_PLATE);
         plater->GetEventHandler()->ProcessEvent(evt);
@@ -639,11 +695,12 @@ static json slice(const json &, const std::atomic_bool &running)
     return run_on_ui_thread(running, [] {
         PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
         if (!plate->is_slice_result_valid())
-            throw std::runtime_error("Slicing failed, see the notifications in BambuStudio");
+            throw std::runtime_error("Slicing failed: " + (last_slicing_error.empty() ? "see the notifications in BambuStudio" : last_slicing_error));
         const PrintStatistics &stats = plate->fff_print()->print_statistics();
         return json{{"print_time", stats.estimated_normal_print_time},
                     {"filament_g", stats.total_weight},
-                    {"filament_m", stats.total_used_filament / 1000.}};
+                    {"filament_m", stats.total_used_filament / 1000.},
+                    {"warnings", slicing_warnings(*plate->fff_print())}};
     });
 }
 
@@ -800,8 +857,13 @@ static const std::vector<McpTool> &tools()
           {"properties", {{"name", {{"type", "string"}}}, {"copies", {{"type", "integer"}, {"default", 1}}}}},
           {"required", json::array({"name"})}},
          duplicate_object},
+        {"undo", "Undo the last change to the plate (add, delete, move, text, object settings...), like Ctrl+Z. "
+                 "Returns what was undone and the new scene. Preset and plate-wide setting changes are not undone.",
+         NO_ARGS, undo},
         {"arrange", "Arrange all objects on the plate and return the new scene.", NO_ARGS, arrange},
-        {"slice", "Slice the current plate with the selected presets. Returns print time and filament use.", NO_ARGS, slice},
+        {"slice", "Slice the current plate with the selected presets. Returns print time, filament use and the slicer's warnings "
+                  "(e.g. floating regions, missing supports); if slicing fails, the error says why.",
+         NO_ARGS, slice},
         {"export_gcode",
          "Slice the current plate if needed and save it to a file. Use .gcode.3mf for Bambu Lab printers, .gcode for plain G-code. "
          "Does not send anything to a printer.",
@@ -955,6 +1017,12 @@ void McpServer::start()
         m_running = false;
         return;
     }
+
+    // Runs before the plater's own handler (wx calls the last bound one first); Skip() passes the event on unchanged.
+    wxGetApp().plater()->Bind(EVT_PROCESS_COMPLETED, [](SlicingProcessCompletedEvent &evt) {
+        last_slicing_error = evt.error() ? evt.format_error_message().first : "";
+        evt.Skip();
+    });
 
     do_accept();
     m_worker = boost::thread([this] { m_io.run(); });
