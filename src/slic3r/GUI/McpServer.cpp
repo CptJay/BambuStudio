@@ -321,6 +321,30 @@ static json duplicate_object(const json &args, const std::atomic_bool &running)
     });
 }
 
+// Plate coordinates, so an OpenSCAD import() lines up with the bounding boxes from get_scene.
+static json export_object(const json &args, const std::atomic_bool &running)
+{
+    namespace fs = boost::filesystem;
+    const std::string name = args.value("name", "");
+    const fs::path    path(args.value("path", ""));
+    if (!path.is_absolute() || !boost::iends_with(path.string(), ".stl"))
+        throw std::invalid_argument("path must be an absolute path ending in .stl");
+    if (!fs::is_directory(path.parent_path()))
+        throw std::invalid_argument("Folder does not exist: " + path.parent_path().string());
+    if (fs::exists(path) && !args.value("overwrite", false))
+        throw std::invalid_argument("File already exists: " + path.string() + " (set overwrite to replace it)");
+
+    return run_on_ui_thread(running, [name, path] {
+        const size_t idx  = find_object(name);
+        TriangleMesh mesh = wxGetApp().plater()->model().objects[idx]->mesh();
+        if (!mesh.write_binary(path.string().c_str()))
+            throw std::runtime_error("Failed to write " + path.string());
+        json result    = object_json(idx);
+        result["path"] = path.string();
+        return result;
+    });
+}
+
 static json delete_objects(const json &args, const std::atomic_bool &running)
 {
     const json names = args.value("names", json());
@@ -459,7 +483,9 @@ static const std::vector<McpTool> &tools()
          add_shape},
         {"render_openscad",
          "Render OpenSCAD code to a mesh and add it as one object on a free spot of the plate. Units are mm, Z is up. "
-         "Use this for any shape add_shape cannot make, and build multi-part parts (e.g. a tray with walls) as one model with union().",
+         "Use this for any shape add_shape cannot make, and build multi-part parts (e.g. a tray with walls) as one model with union(). "
+         "To change an existing object (engrave text, drill a hole...), export_object it, import() the STL here, combine with "
+         "difference() or union(), then delete the old object.",
          {{"type", "object"},
           {"properties", {{"code", {{"type", "string"}, {"description", "OpenSCAD source"}}}, {"name", {{"type", "string"}}}}},
           {"required", json::array({"code"})}},
@@ -491,6 +517,16 @@ static const std::vector<McpTool> &tools()
                        {"description", "[x, y, z] factors multiplied with the current scale, along the object's own axes"}}}}},
           {"required", json::array({"name"})}},
          transform_object},
+        {"export_object",
+         "Save an object as a binary STL, in plate coordinates (they match get_scene's bounding boxes). "
+         "Use it with render_openscad's import() to edit existing objects.",
+         {{"type", "object"},
+          {"properties",
+           {{"name", {{"type", "string"}}},
+            {"path", {{"type", "string"}, {"description", "Absolute path ending in .stl"}}},
+            {"overwrite", {{"type", "boolean"}, {"default", false}}}}},
+          {"required", json::array({"name", "path"})}},
+         export_object},
         {"duplicate_object", "Make copies of an object, placed on free spots. Copies are named \"<name> 2\", \"<name> 3\"...",
          {{"type", "object"},
           {"properties", {{"name", {{"type", "string"}}}, {"copies", {{"type", "integer"}, {"default", 1}}}}},
