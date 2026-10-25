@@ -20,6 +20,9 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r_version.h"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Utils.hpp"
+#include "libslic3r/GCode/PostProcessor.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/miniz_extension.hpp"
 #include "GLCanvas3D.hpp"
@@ -302,6 +305,43 @@ static json slice(const json &, const std::atomic_bool &running)
     });
 }
 
+// Writes a file only; nothing is ever sent to a printer from a tool.
+static json export_gcode(const json &args, const std::atomic_bool &running)
+{
+    namespace fs = boost::filesystem;
+    const fs::path path(args.value("path", ""));
+    const bool     is_3mf = boost::iends_with(path.string(), ".gcode.3mf");
+    if (!path.is_absolute() || !(is_3mf || boost::iends_with(path.string(), ".gcode")))
+        throw std::invalid_argument("path must be an absolute path ending in .gcode or .gcode.3mf");
+    if (!fs::is_directory(path.parent_path()))
+        throw std::invalid_argument("Folder does not exist: " + path.parent_path().string());
+    if (fs::exists(path) && !args.value("overwrite", false))
+        throw std::invalid_argument("File already exists: " + path.string() + " (set overwrite to replace it)");
+
+    // Re-slicing an up-to-date plate is instant.
+    json result = slice(json(), running);
+
+    run_on_ui_thread(running, [path, is_3mf] {
+        Plater    *plater = wxGetApp().plater();
+        PartPlate *plate  = plater->get_partplate_list().get_curr_plate();
+        if (is_3mf) {
+            // Same call as File > Export > Export plate sliced file, without its file dialog.
+            if (plater->export_3mf(path, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel,
+                                   plater->get_partplate_list().get_curr_plate_index()) < 0)
+                throw std::runtime_error("Failed to write " + path.string());
+        } else {
+            // Same as BackgroundSlicingProcess::export_gcode(): the temp G-code is already post-processed.
+            std::string error;
+            if (copy_file(plate->get_tmp_gcode_path(), path.string(), error) != SUCCESS)
+                throw std::runtime_error("Failed to write " + path.string() + ": " + error);
+            gcode_add_line_number(path.string(), plate->fff_print()->full_print_config());
+        }
+        return json();
+    });
+    result["path"] = path.string();
+    return result;
+}
+
 struct McpTool
 {
     const char                                                *name;
@@ -349,6 +389,15 @@ static const std::vector<McpTool> &tools()
          delete_objects},
         {"arrange", "Arrange all objects on the plate and return the new scene.", NO_ARGS, arrange},
         {"slice", "Slice the current plate with the selected presets. Returns print time and filament use.", NO_ARGS, slice},
+        {"export_gcode",
+         "Slice the current plate if needed and save it to a file. Use .gcode.3mf for Bambu Lab printers, .gcode for plain G-code. "
+         "Does not send anything to a printer.",
+         {{"type", "object"},
+          {"properties",
+           {{"path", {{"type", "string"}, {"description", "Absolute path ending in .gcode or .gcode.3mf"}}},
+            {"overwrite", {{"type", "boolean"}, {"default", false}}}}},
+          {"required", json::array({"path"})}},
+         export_gcode},
     };
     return tools;
 }
