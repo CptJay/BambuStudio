@@ -15,7 +15,7 @@ from pathlib import Path
 URL = "http://127.0.0.1:13619/mcp"
 TOOLS = {"get_scene", "add_shape", "render_openscad", "get_view", "import_model", "delete_objects", "add_text",
          "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode",
-         "get_settings", "set_settings", "select_process_preset", "undo", "save_project", "open_project"}
+         "get_settings", "set_settings", "select_process_preset", "undo", "save_project", "open_project", "orient"}
 
 
 def fail(message):
@@ -74,6 +74,15 @@ def main():
         names = [o["name"] for o in call("get_scene")["objects"]]
         check(len(names) == len(set(names)) and {"twin", "twin 2", "twin 3"} <= set(names), f"duplicate names: {names}")
         call("delete_objects", {"names": ["twin", "twin 2", "twin 3"]})
+
+        # A thin plate standing on its edge must be laid flat.
+        call("add_shape", {"shape": "box", "size": [40, 30, 3], "name": "standing"})
+        call("transform_object", {"name": "standing", "rotate": [90, 0, 0]})
+        # Named twice on purpose: a repeated name must not rotate the plate twice.
+        flat = call("orient", {"names": ["standing", "standing"]})["objects"][0]
+        check(round(size(flat)[2]) == 3, f"orient did not lay the plate flat: {flat}")
+        call("orient", {"names": []}, expect_error=True)
+        call("delete_objects", {"names": ["standing"]})
 
         # Settings: only per-object changes and a re-select of the current preset, so the user's presets stay untouched.
         process = call("get_settings")["presets"]["process"]
