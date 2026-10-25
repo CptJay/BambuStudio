@@ -23,6 +23,11 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/GCode/PostProcessor.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/AABBMesh.hpp"
+#include "libslic3r/Emboss.hpp"
+#include "slic3r/Utils/WxFontUtils.hpp"
+#include <wx/settings.h>
+#include <wx/fontenum.h>
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/miniz_extension.hpp"
 #include "GLCanvas3D.hpp"
@@ -249,18 +254,23 @@ static std::optional<Vec3d> vec3_arg(const json &args, const char *key)
     return Vec3d(v[0].get<double>(), v[1].get<double>(), v[2].get<double>());
 }
 
+// Reads an optional [x, y] number array argument.
+static std::optional<Vec2d> vec2_arg(const json &args, const char *key)
+{
+    if (!args.contains(key))
+        return std::nullopt;
+    const json &v = args[key];
+    if (!v.is_array() || v.size() != 2 || !v[0].is_number() || !v[1].is_number())
+        throw std::invalid_argument(std::string(key) + " must be [x, y]");
+    return Vec2d(v[0].get<double>(), v[1].get<double>());
+}
+
 static json transform_object(const json &args, const std::atomic_bool &running)
 {
     const std::string name   = args.value("name", "");
     const auto        rotate = vec3_arg(args, "rotate");
     const auto        scale  = vec3_arg(args, "scale");
-    std::optional<Vec2d> position;
-    if (args.contains("position")) {
-        const json &p = args["position"];
-        if (!p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number())
-            throw std::invalid_argument("position must be [x, y]");
-        position = Vec2d(p[0].get<double>(), p[1].get<double>());
-    }
+    const auto        position = vec2_arg(args, "position");
     if (scale && (scale->array() <= 0.).any())
         throw std::invalid_argument("scale factors must be > 0");
     if (!rotate && !scale && !position)
@@ -318,6 +328,87 @@ static json duplicate_object(const json &args, const std::atomic_bool &running)
             objects.push_back(object_json(i));
         }
         return json{{"objects", objects}};
+    });
+}
+
+// Text as a flat mesh lying on Z = 0, centered on the origin, built like the Text gizmo's mesh. UI thread only (wxFont).
+static TriangleMesh text_mesh(const std::string &text, const std::string &font, double size, double height)
+{
+    // Font lookup falls back to a similar font for unknown names, so check the name exists first.
+    if (!font.empty() && !wxFontEnumerator::IsValidFacename(font))
+        throw std::invalid_argument("Font not installed: " + font);
+    const wxFont wx_font = font.empty() ? wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT) : wxFont(wxFontInfo(10).FaceName(font));
+    std::unique_ptr<Emboss::FontFile> file = WxFontUtils::create_font_file(wx_font);
+    if (!file)
+        throw std::runtime_error("Font not found: " + font);
+    Emboss::FontFileWithCache font_with_cache(std::move(file));
+    const FontProp            prop{float(size)};
+    const double              scale = Emboss::get_text_shape_scale(prop, *font_with_cache.font_file);
+    EmbossShape               shape;
+    const ExPolygons          shapes = Emboss::text2shapes(shape, font_with_cache, text.c_str(), prop, scale).expolygons;
+    if (shapes.empty())
+        throw std::runtime_error("The font has no glyphs for this text");
+
+    // Shapes are in font units; the projection scales them to mm and extrudes them by height.
+    Emboss::ProjectTransform project(std::make_unique<Emboss::ProjectZ>(height / scale), Transform3d(Eigen::Scaling(scale)));
+    TriangleMesh mesh(Emboss::polygons2model(shapes, project));
+    const BoundingBoxf3 bb = mesh.bounding_box();
+    mesh.translate(-bb.center().x(), -bb.center().y(), -bb.min.z());
+    return mesh;
+}
+
+// shortcut: text lies flat on the surface found straight below the position, so it suits upward-facing flat faces only;
+// rotate the object first for other faces, or use the Text gizmo for curved ones.
+static json add_text(const json &args, const std::atomic_bool &running)
+{
+    const std::string name   = args.value("name", "");
+    const std::string text   = args.value("text", "");
+    const std::string font   = args.value("font", "");
+    const std::string mode   = args.value("mode", "engrave");
+    const double      size   = args.value("size", 10.);
+    const double      depth  = args.value("depth", 1.);
+    const double      angle  = args.value("rotation", 0.);
+    if (text.empty())
+        throw std::invalid_argument("text is empty");
+    if (mode != "engrave" && mode != "emboss")
+        throw std::invalid_argument("mode must be engrave or emboss");
+    if (size <= 0. || depth <= 0.)
+        throw std::invalid_argument("size and depth must be > 0");
+    const auto position = vec2_arg(args, "position");
+
+    return run_on_ui_thread(running, [=] {
+        Plater       *plater = wxGetApp().plater();
+        const size_t  idx    = find_object(name);
+        ModelObject  *obj    = plater->model().objects[idx];
+        const BoundingBoxf3 bb = obj->instance_bounding_box(0);
+        const Vec2d   xy     = position.value_or(Vec2d(bb.center().x(), bb.center().y()));
+
+        // Find the surface height under the text by casting a ray down onto the object.
+        const TriangleMesh         world_mesh = obj->mesh(); // AABBMesh keeps a pointer to it, so it must outlive the query
+        const AABBMesh             surface(world_mesh);
+        const AABBMesh::hit_result hit = surface.query_ray_hit(Vec3d(xy.x(), xy.y(), bb.max.z() + 1.), -Vec3d::UnitZ());
+        if (!hit.is_hit())
+            throw std::invalid_argument("position is not over the object");
+        const double top = hit.position().z();
+
+        // A little extra height that passes the surface, so the cut is clean or the raised text is fused to the part.
+        const double overlap = 0.2;
+        TriangleMesh mesh    = text_mesh(text, font, size, depth + overlap);
+        const bool   engrave = mode == "engrave";
+        mesh.transform(Transform3d(Eigen::Translation3d(xy.x(), xy.y(), engrave ? top - depth : top - overlap) *
+                                   Eigen::AngleAxisd(angle * PI / 180., Vec3d::UnitZ())));
+        // Volumes are stored in object coordinates.
+        // true: flip the triangles back when the instance is mirrored, so the volume is not inside out.
+        mesh.transform(obj->instances[0]->get_matrix().inverse(), true);
+
+        Plater::TakeSnapshot snapshot(plater, "Add Text");
+        ModelVolume *volume = obj->add_volume(std::move(mesh), engrave ? ModelVolumeType::NEGATIVE_VOLUME : ModelVolumeType::MODEL_PART);
+        volume->name        = text;
+        // Same extruder rule as ObjectList::load_generic_subobject().
+        volume->config.set_key_value("extruder", new ConfigOptionInt(!engrave && obj->config.has("extruder") ? obj->config.opt_int("extruder") : 0));
+        wxGetApp().obj_list()->reorder_volumes_and_get_selection(int(idx));
+        plater->changed_object(*obj);
+        return object_json(idx);
     });
 }
 
@@ -517,6 +608,23 @@ static const std::vector<McpTool> &tools()
                        {"description", "[x, y, z] factors multiplied with the current scale, along the object's own axes"}}}}},
           {"required", json::array({"name"})}},
          transform_object},
+        {"add_text",
+         "Engrave text into, or emboss it onto, the top surface of an object, using a system font. The text becomes a part of the "
+         "object (a negative part when engraving), so the user can still move or delete it in BambuStudio. Works on flat, "
+         "upward-facing surfaces; rotate the object first to write on another face.",
+         {{"type", "object"},
+          {"properties",
+           {{"name", {{"type", "string"}, {"description", "Object to write on"}}},
+            {"text", {{"type", "string"}}},
+            {"mode", {{"type", "string"}, {"enum", json::array({"engrave", "emboss"})}, {"default", "engrave"}}},
+            {"position", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 2}, {"maxItems", 2},
+                          {"description", "[x, y] in mm, center of the text on the plate; default: center of the object"}}},
+            {"size", {{"type", "number"}, {"description", "Font size in mm"}, {"default", 10}}},
+            {"depth", {{"type", "number"}, {"description", "Engrave depth or emboss height in mm"}, {"default", 1}}},
+            {"rotation", {{"type", "number"}, {"description", "Degrees around Z, counterclockwise"}, {"default", 0}}},
+            {"font", {{"type", "string"}, {"description", "Font name, e.g. \"DejaVu Sans\"; default: the system UI font"}}}}},
+          {"required", json::array({"name", "text"})}},
+         add_text},
         {"export_object",
          "Save an object as a binary STL, in plate coordinates (they match get_scene's bounding boxes). "
          "Use it with render_openscad's import() to edit existing objects.",
