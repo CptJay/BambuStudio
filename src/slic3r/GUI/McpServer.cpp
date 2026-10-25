@@ -32,6 +32,9 @@
 #include "libslic3r/miniz_extension.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
+#include "Tab.hpp"
+#include "GUI_Factories.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include "ObjectDataViewModel.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
@@ -412,6 +415,139 @@ static json add_text(const json &args, const std::atomic_bool &running)
     });
 }
 
+// Shown by get_settings when no keys are asked for.
+static const std::vector<std::string> COMMON_SETTINGS = {
+    "layer_height",    "initial_layer_print_height", "wall_loops", "top_shell_layers", "bottom_shell_layers", "sparse_infill_density",
+    "sparse_infill_pattern", "enable_support",       "support_type", "brim_type",      "ironing_type",        "print_sequence"};
+
+static std::string preset_label(const PresetCollection &presets)
+{
+    return presets.get_edited_preset().name + (presets.current_is_dirty() ? " (modified)" : "");
+}
+
+// Parses a JSON value into the option for key, checked like the settings panel does. Throws for unknown keys and bad values.
+static ConfigOption *parse_setting(const std::string &key, const json &value, const std::vector<std::string> &allowed)
+{
+    const ConfigOptionDef *def = print_config_def.get(key);
+    if (def == nullptr || std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+        throw std::invalid_argument("Not a process setting that can be changed here: " + key);
+    // Shell commands run after slicing; a tool must never be able to set them.
+    if (key == "post_process")
+        throw std::invalid_argument("post_process can only be set in BambuStudio");
+    const std::string text = value.is_string() ? value.get<std::string>() : value.is_boolean() ? (value.get<bool>() ? "1" : "0") : value.dump();
+    std::unique_ptr<ConfigOption> opt(def->create_empty_option());
+    if (!opt->deserialize(text))
+        throw std::invalid_argument("Invalid value for " + key + ": " + text);
+    if (def->type == coFloat || def->type == coInt || def->type == coPercent) {
+        const double number = def->type == coInt ? opt->getInt() : opt->getFloat(); // getFloat() throws for ints
+        if (number < def->min || number > def->max)
+            throw std::invalid_argument(key + " must be between " + std::to_string(def->min) + " and " + std::to_string(def->max));
+    }
+    return opt.release();
+}
+
+static json get_settings(const json &args, const std::atomic_bool &running)
+{
+    const json keys = args.value("keys", json::array());
+    if (!keys.is_array() || !std::all_of(keys.begin(), keys.end(), [](const json &k) { return k.is_string(); }))
+        throw std::invalid_argument("keys must be an array of setting names");
+    const std::string name = args.value("name", "");
+
+    return run_on_ui_thread(running, [keys, name] {
+        PresetBundle            &bundle = *wxGetApp().preset_bundle;
+        const DynamicPrintConfig config = bundle.full_config();
+        const ModelObject       *obj    = name.empty() ? nullptr : wxGetApp().plater()->model().objects[find_object(name)];
+
+        json settings = json::object();
+        for (const std::string &key : keys.empty() ? COMMON_SETTINGS : keys.get<std::vector<std::string>>()) {
+            const bool          from_object = obj != nullptr && obj->config.has(key);
+            const ConfigOption *opt         = from_object ? obj->config.option(key) : config.option(key);
+            if (opt == nullptr)
+                throw std::invalid_argument("Unknown setting: " + key);
+            json entry = {{"value", opt->serialize()}, {"label", print_config_def.get(key)->label}};
+            if (obj != nullptr)
+                entry["source"] = from_object ? "object" : "plate";
+            settings[key] = entry;
+        }
+        return json{{"presets", {{"printer", preset_label(bundle.printers)},
+                                 {"process", preset_label(bundle.prints)},
+                                 {"filaments", bundle.filament_presets}}},
+                    {"settings", settings}};
+    });
+}
+
+static json set_settings(const json &args, const std::atomic_bool &running)
+{
+    const json values = args.value("values", json::object());
+    if (!values.is_object() || values.empty())
+        throw std::invalid_argument("values must be an object like {\"wall_loops\": 3}");
+    const std::string name = args.value("name", "");
+
+    const json requested = run_on_ui_thread(running, [values, name] {
+        // Parse everything first, so a bad value changes nothing.
+        DynamicPrintConfig changes;
+        json               requested = json::object();
+        const std::vector<std::string> allowed = name.empty() ? Preset::print_options() : SettingsFactory::get_options(false);
+        for (const auto &[key, value] : values.items()) {
+            changes.set_key_value(key, parse_setting(key, value, allowed));
+            requested[key] = changes.option(key)->serialize();
+        }
+        // shortcut: ConfigManipulation shows a modal dialog for some invalid values (zero first layer, huge elephant foot...);
+        // the call waits until it is clicked. Only layer_height is caught here.
+        if (changes.has("layer_height") && (changes.opt_float("layer_height") <= 0. || changes.opt_float("layer_height") > 0.6))
+            throw std::invalid_argument("layer_height must be above 0 and at most 0.6 mm");
+
+        Plater *plater = wxGetApp().plater();
+        if (name.empty()) {
+            // Same path as editing the process settings panel; the preset shows as modified.
+            wxGetApp().get_tab(Preset::TYPE_PRINT)->load_config(changes);
+        } else {
+            const size_t idx = find_object(name);
+            ModelObject *obj = plater->model().objects[idx];
+            Plater::TakeSnapshot snapshot(plater, "Object settings changed");
+            for (const std::string &key : changes.keys())
+                obj->config.set_key_value(key, changes.option(key)->clone());
+            ObjectList *list = wxGetApp().obj_list();
+            list->add_settings_item(list->GetModel()->GetItemById(int(idx)), &obj->config.get());
+            plater->changed_object(*obj);
+        }
+        return requested;
+    });
+    json keys = json::array();
+    for (const auto &item : values.items())
+        keys.push_back(item.key());
+    json result = get_settings({{"keys", keys}, {"name", name}}, running);
+    // The panel's own rules can change a value right after it is set; say so instead of reporting success.
+    for (auto &[key, entry] : result["settings"].items())
+        if (entry["value"] != requested[key])
+            entry["changed_by_bambustudio"] = "asked for " + requested[key].get<std::string>();
+    return result;
+}
+
+// shortcut: process presets only; printer and filament presets have dialogs and AMS slots, so they are still chosen in the app.
+static json select_process_preset(const json &args, const std::atomic_bool &running)
+{
+    const std::string name = args.value("preset", "");
+    return run_on_ui_thread(running, [name] {
+        PresetCollection &prints = wxGetApp().preset_bundle->prints;
+        // Switching would open the "unsaved changes" dialog, or lose the user's edits.
+        if (prints.current_is_dirty())
+            throw std::runtime_error("The process preset has unsaved changes. Save or discard them in BambuStudio first, "
+                                     "or keep this preset and use set_settings.");
+        const Preset *preset = prints.find_preset(name, false);
+        if (preset == nullptr || !preset->is_visible || !preset->is_compatible) {
+            std::string available;
+            for (const Preset &p : prints)
+                if (p.is_visible && p.is_compatible)
+                    available += (available.empty() ? "" : ", ") + p.name;
+            throw std::invalid_argument("No process preset named \"" + name + "\" for this printer. Available: " + available);
+        }
+        wxGetApp().get_tab(Preset::TYPE_PRINT)->select_preset(name);
+        wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
+        return json{{"process", preset_label(prints)}};
+    });
+}
+
 // Plate coordinates, so an OpenSCAD import() lines up with the bounding boxes from get_scene.
 static json export_object(const json &args, const std::atomic_bool &running)
 {
@@ -625,6 +761,30 @@ static const std::vector<McpTool> &tools()
             {"font", {{"type", "string"}, {"description", "Font name, e.g. \"DejaVu Sans\"; default: the system UI font"}}}}},
           {"required", json::array({"name", "text"})}},
          add_text},
+        {"get_settings",
+         "Read the selected presets and print settings. Without keys, returns common ones (layer height, walls, infill, supports, "
+         "brim...). With an object name, shows that object's overrides (source \"object\") and the plate values for the rest.",
+         {{"type", "object"},
+          {"properties",
+           {{"keys", {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Setting names, e.g. [\"wall_loops\"]"}}},
+            {"name", {{"type", "string"}, {"description", "Object name, for per-object settings"}}}}}},
+         get_settings},
+        {"set_settings",
+         "Change process settings (layer height, walls, infill, supports...), for the whole plate or, with an object name, for that "
+         "object only. Values are checked like the settings panel does; one bad value changes nothing. Unusual values may open a "
+         "BambuStudio dialog that the user must answer. Pick the process preset "
+         "first: plate changes mark it as modified, and a modified preset cannot be switched by select_process_preset.",
+         {{"type", "object"},
+          {"properties",
+           {{"values", {{"type", "object"}, {"description", "e.g. {\"wall_loops\": 3, \"sparse_infill_density\": \"25%\", \"enable_support\": true}"}}},
+            {"name", {{"type", "string"}, {"description", "Object name; omit for the whole plate"}}}}},
+          {"required", json::array({"values"})}},
+         set_settings},
+        {"select_process_preset",
+         "Switch the process preset (e.g. \"0.12mm Fine @BBL X1C\"). An unknown name returns the list of available presets. "
+         "Printer and filament presets are chosen in BambuStudio.",
+         {{"type", "object"}, {"properties", {{"preset", {{"type", "string"}}}}}, {"required", json::array({"preset"})}},
+         select_process_preset},
         {"export_object",
          "Save an object as a binary STL, in plate coordinates (they match get_scene's bounding boxes). "
          "Use it with render_openscad's import() to edit existing objects.",

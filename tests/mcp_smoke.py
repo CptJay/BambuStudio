@@ -13,7 +13,8 @@ from pathlib import Path
 
 URL = "http://127.0.0.1:13619/mcp"
 TOOLS = {"get_scene", "add_shape", "render_openscad", "get_view", "import_model", "delete_objects", "add_text",
-         "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode"}
+         "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode",
+         "get_settings", "set_settings", "select_process_preset"}
 
 
 def fail(message):
@@ -65,6 +66,19 @@ def main():
         call("add_text", {"name": "smoke box", "text": "UP", "mode": "emboss", "position": [100, 85]})
         call("add_text", {"name": "smoke box", "text": "X", "font": "No Such Font 123"}, expect_error=True)
         call("duplicate_object", {"name": "smoke box", "copies": 1})
+
+        # Settings: only per-object changes and a re-select of the current preset, so the user's presets stay untouched.
+        process = call("get_settings")["presets"]["process"]
+        if not process.endswith("(modified)"):
+            call("select_process_preset", {"preset": process})
+        call("select_process_preset", {"preset": "No Such Preset"}, expect_error=True)
+        changed = call("set_settings", {"name": "smoke box", "values": {"wall_loops": 3, "sparse_infill_density": "30%"}})
+        check(changed["settings"]["wall_loops"] == {"label": "Wall loops", "value": "3", "source": "object"}, f"set_settings {changed}")
+        call("set_settings", {"name": "smoke box", "values": {"wall_loops": 4, "sparse_infill_pattern": "spaghetti"}}, expect_error=True)
+        check(call("get_settings", {"name": "smoke box", "keys": ["wall_loops"]})["settings"]["wall_loops"]["value"] == "3",
+              "a rejected set_settings call still changed wall_loops")
+        call("set_settings", {"values": {"nozzle_diameter": "0.6"}}, expect_error=True)
+        call("set_settings", {"values": {"post_process": "echo hacked"}}, expect_error=True)
 
         stl = tmp / "box.stl"
         call("export_object", {"name": "smoke box", "path": str(stl)})
