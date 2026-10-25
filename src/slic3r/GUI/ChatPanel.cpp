@@ -1,7 +1,13 @@
 #include "ChatPanel.hpp"
 
+#include <fstream>
+#include <sstream>
+
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
+#include <boost/process.hpp>
 
 #include <wx/button.h>
 #include <wx/choice.h>
@@ -16,6 +22,7 @@
 #include "McpServer.hpp"
 #include "Plater.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/Http.hpp"
 
 namespace Slic3r {
@@ -24,13 +31,14 @@ namespace GUI {
 using json = nlohmann::json;
 
 enum class KeyField { None, Optional, Required };
+enum class Api { Anthropic, OpenAI, ClaudeCode };
 
 struct ChatProvider
 {
     const char *id;
     const char *name;
-    bool        anthropic; // Anthropic Messages API; all others speak the OpenAI Chat Completions API
-    const char *url;
+    Api         api;
+    const char *url;       // empty: set in the settings (Custom's URL, Claude Code's path)
     const char *model;     // default, editable in the settings
     KeyField    key;
     // shortcut: per provider, not per model; a vision model on a local server gets no images. Add a setting if that is needed.
@@ -39,15 +47,17 @@ struct ChatProvider
 
 // Default models change often; they are only a starting point in the settings dialog.
 static const std::vector<ChatProvider> PROVIDERS = {
-    {"claude", "Claude", true, "https://api.anthropic.com/v1", "claude-sonnet-5-5", KeyField::Required, true},
-    {"openai", "OpenAI", false, "https://api.openai.com/v1", "gpt-5", KeyField::Required, true},
-    {"gemini", "Gemini", false, "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest", KeyField::Required, true},
-    {"mistral", "Mistral", false, "https://api.mistral.ai/v1", "mistral-large-latest", KeyField::Required, false},
-    {"groq", "Groq", false, "https://api.groq.com/openai/v1", "openai/gpt-oss-120b", KeyField::Required, false},
-    {"openrouter", "OpenRouter", false, "https://openrouter.ai/api/v1", "openrouter/auto", KeyField::Required, false},
-    {"ollama", "Ollama (local)", false, "http://localhost:11434/v1", "qwen3", KeyField::None, false},
-    {"lmstudio", "LM Studio (local)", false, "http://localhost:1234/v1", "", KeyField::None, false},
-    {"custom", "Custom (OpenAI-compatible)", false, "", "", KeyField::Optional, false},
+    // Runs the user's Claude Code CLI, so its login (and subscription) is used; the tools go through the MCP server.
+    {"claude_code", "Claude (subscription, via Claude Code)", Api::ClaudeCode, "", "", KeyField::None, true},
+    {"claude", "Claude (API key)", Api::Anthropic, "https://api.anthropic.com/v1", "claude-sonnet-5-5", KeyField::Required, true},
+    {"openai", "OpenAI", Api::OpenAI, "https://api.openai.com/v1", "gpt-5", KeyField::Required, true},
+    {"gemini", "Gemini", Api::OpenAI, "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest", KeyField::Required, true},
+    {"mistral", "Mistral", Api::OpenAI, "https://api.mistral.ai/v1", "mistral-large-latest", KeyField::Required, false},
+    {"groq", "Groq", Api::OpenAI, "https://api.groq.com/openai/v1", "openai/gpt-oss-120b", KeyField::Required, false},
+    {"openrouter", "OpenRouter", Api::OpenAI, "https://openrouter.ai/api/v1", "openrouter/auto", KeyField::Required, false},
+    {"ollama", "Ollama (local)", Api::OpenAI, "http://localhost:11434/v1", "qwen3", KeyField::None, false},
+    {"lmstudio", "LM Studio (local)", Api::OpenAI, "http://localhost:1234/v1", "", KeyField::None, false},
+    {"custom", "Custom (OpenAI-compatible)", Api::OpenAI, "", "", KeyField::Optional, false},
 };
 
 static const int   MAX_ROUNDS = 25; // tool rounds per message, so a runaway loop cannot keep spending
@@ -80,6 +90,24 @@ static const ChatProvider &current_provider()
     return PROVIDERS.front();
 }
 
+// The installed Claude Code CLI: on the PATH, else where the native installer puts it
+// (an app started from the desktop menu may not have ~/.local/bin on its PATH).
+static std::string find_claude_code()
+{
+    const boost::filesystem::path on_path = boost::process::search_path("claude");
+    if (!on_path.empty())
+        return on_path.string();
+#ifdef _WIN32
+    const char *home = std::getenv("USERPROFILE");
+    const boost::filesystem::path installed = boost::filesystem::path(home ? home : "") / ".local" / "bin" / "claude.exe";
+#else
+    const char *home = std::getenv("HOME");
+    const boost::filesystem::path installed = boost::filesystem::path(home ? home : "") / ".local" / "bin" / "claude";
+#endif
+    boost::system::error_code ec;
+    return boost::filesystem::exists(installed, ec) ? installed.string() : "";
+}
+
 struct ChatPanel::Config
 {
     const ChatProvider *provider;
@@ -88,13 +116,14 @@ struct ChatPanel::Config
     static Config load()
     {
         const ChatProvider &p = current_provider();
-        std::string url = p.url[0] ? std::string(p.url) : config_get("chat_custom_url");
+        std::string url = p.url[0] ? std::string(p.url) : config_get(std::string("chat_") + p.id + "_url", p.api == Api::ClaudeCode ? find_claude_code() : "");
         while (!url.empty() && url.back() == '/')
             url.pop_back();
         return {&p, url, config_get(std::string("chat_") + p.id + "_model", p.model), provider_key(p)};
     }
-    bool complete() const { return !url.empty() && !model.empty() && (provider->key != KeyField::Required || !key.empty()); }
-    wxString speaker() const { return provider->url[0] ? wxString(provider->name) : _L("Assistant"); }
+    // Claude Code without a model uses its own default.
+    bool complete() const { return !url.empty() && (!model.empty() || provider->api == Api::ClaudeCode) && (provider->key != KeyField::Required || !key.empty()); }
+    wxString speaker() const { return provider->api == Api::ClaudeCode ? wxString("Claude") : provider->url[0] ? wxString(provider->name) : _L("Assistant"); }
 };
 
 // Returns true when the settings were saved.
@@ -107,7 +136,6 @@ static bool edit_settings(wxWindow *parent)
     auto *key       = new wxTextCtrl(&dlg, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
     auto *url_label = new wxStaticText(&dlg, wxID_ANY, _L("Base URL"));
     auto *url       = new wxTextCtrl(&dlg, wxID_ANY);
-    url->SetHint("http://localhost:8080/v1");
     for (const ChatProvider &p : PROVIDERS)
         provider->Append(from_u8(p.name));
 
@@ -120,7 +148,7 @@ static bool edit_settings(wxWindow *parent)
     }
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(grid, 1, wxEXPAND | wxALL, dlg.FromDIP(12));
-    auto *note = new wxStaticText(&dlg, wxID_ANY, _L("Keys are stored unencrypted in the app config, one per provider."));
+    auto *note = new wxStaticText(&dlg, wxID_ANY, "");
     note->SetForegroundColour(TOOL_COLOUR);
     sizer->Add(note, 0, wxLEFT | wxRIGHT, dlg.FromDIP(12));
     sizer->Add(dlg.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxEXPAND | wxALL, dlg.FromDIP(12));
@@ -129,9 +157,15 @@ static bool edit_settings(wxWindow *parent)
     auto load = [&](int i) {
         const ChatProvider &p = PROVIDERS[i];
         model->SetValue(from_u8(config_get(std::string("chat_") + p.id + "_model", p.model)));
-        model->SetHint(p.id == std::string("lmstudio") ? _L("Model id shown in LM Studio") : wxString());
+        const bool claude_code = p.api == Api::ClaudeCode;
+        model->SetHint(p.id == std::string("lmstudio") ? _L("Model id shown in LM Studio") : claude_code ? _L("Claude Code's default (or sonnet, opus...)") : wxString());
         key->SetValue(from_u8(provider_key(p)));
-        url->SetValue(from_u8(config_get("chat_custom_url")));
+        url->SetValue(from_u8(config_get(std::string("chat_") + p.id + "_url")));
+        url_label->SetLabel(claude_code ? _L("Claude Code path") : _L("Base URL"));
+        const std::string found = claude_code ? find_claude_code() : "";
+        url->SetHint(claude_code ? (found.empty() ? _L("Not found: install Claude Code or enter its path") : from_u8(found)) : wxString("http://localhost:8080/v1"));
+        note->SetLabel(claude_code ? _L("Uses your Claude Code login: no API key, usage counts against your Claude plan.") :
+                                     _L("Keys are stored unencrypted in the app config, one per provider."));
         key_label->Show(p.key != KeyField::None);
         key->Show(p.key != KeyField::None);
         url_label->Show(!p.url[0]);
@@ -152,7 +186,7 @@ static bool edit_settings(wxWindow *parent)
     if (p.key != KeyField::None)
         cfg->set(std::string("chat_") + p.id + "_key", into_u8(key->GetValue().Strip(wxString::both)));
     if (!p.url[0])
-        cfg->set("chat_custom_url", into_u8(url->GetValue().Strip(wxString::both)));
+        cfg->set(std::string("chat_") + p.id + "_url", into_u8(url->GetValue().Strip(wxString::both)));
     return true;
 }
 
@@ -173,7 +207,7 @@ struct Reply
 
 static void add_prompt(const ChatPanel::Config &cfg, json &history, const std::string &prompt)
 {
-    if (!cfg.provider->anthropic) {
+    if (cfg.provider->api != Api::Anthropic) {
         history.push_back({{"role", "user"}, {"content", prompt}});
         return;
     }
@@ -188,7 +222,7 @@ static void add_prompt(const ChatPanel::Config &cfg, json &history, const std::s
 static json request_body(const ChatPanel::Config &cfg, const json &history)
 {
     json tools = json::array();
-    if (cfg.provider->anthropic) {
+    if (cfg.provider->api == Api::Anthropic) {
         for (const json &t : mcp_tool_list())
             tools.push_back({{"name", t["name"]}, {"description", t["description"]}, {"input_schema", t["inputSchema"]}});
         // Cache the tools and the history so far; both repeat on every request.
@@ -209,7 +243,7 @@ static json request_body(const ChatPanel::Config &cfg, const json &history)
 static Reply read_reply(const ChatPanel::Config &cfg, json &history, const json &reply)
 {
     Reply out;
-    if (cfg.provider->anthropic) {
+    if (cfg.provider->api == Api::Anthropic) {
         const json content = reply.value("content", json::array());
         history.push_back({{"role", "assistant"}, {"content", content}});
         for (const json &block : content) {
@@ -245,7 +279,7 @@ static Reply read_reply(const ChatPanel::Config &cfg, json &history, const json 
 // results[i] is the MCP tool result ({content, isError}) of calls[i].
 static void add_results(const ChatPanel::Config &cfg, json &history, const std::vector<ToolCall> &calls, const std::vector<json> &results)
 {
-    if (cfg.provider->anthropic) {
+    if (cfg.provider->api == Api::Anthropic) {
         json blocks = json::array();
         for (size_t i = 0; i < calls.size(); ++i) {
             json content = json::array();
@@ -330,8 +364,9 @@ ChatPanel::ChatPanel(wxWindow *parent) : wxPanel(parent, wxID_ANY)
 
 ChatPanel::~ChatPanel()
 {
-    // Stops the HTTP request (progress callback) and any waiting tool, then the turn ends.
+    // Stops the HTTP request (progress callback), Claude Code and any waiting tool, then the turn ends.
     m_running = false;
+    kill_claude_code();
     if (m_worker.joinable())
         m_worker.join();
 }
@@ -349,7 +384,7 @@ bool ChatPanel::open_settings()
     if (!edit_settings(this))
         return false;
     // The history is in the old provider's format.
-    if (Config::load().provider != before && !m_messages.empty()) {
+    if (Config::load().provider != before && (!m_messages.empty() || !m_session.empty())) {
         new_chat();
         append(_L("Provider changed: started a new chat.") + "\n", TOOL_COLOUR);
     }
@@ -361,6 +396,7 @@ void ChatPanel::send()
 {
     if (m_running) {
         m_running = false;
+        kill_claude_code();
         m_send->SetLabel(_L("Stopping..."));
         m_send->Disable();
         return;
@@ -384,6 +420,7 @@ void ChatPanel::send()
 void ChatPanel::new_chat()
 {
     m_messages = json::array();
+    m_session.clear();
     m_transcript->Clear();
     m_input->SetFocus();
 }
@@ -394,6 +431,11 @@ void ChatPanel::run_turn(const Config &cfg, const std::string &prompt)
     auto ui_append = [this](const wxString &text, const wxColour &colour = wxNullColour) { CallAfter([this, text, colour] { append(text, colour); }); };
     const json saved = m_messages;
     try {
+        if (cfg.provider->api == Api::ClaudeCode) {
+            run_claude_code(cfg, prompt);
+            finish_turn();
+            return;
+        }
         add_prompt(cfg, m_messages, prompt);
         for (int round = 0;; ++round) {
             if (round == MAX_ROUNDS) {
@@ -422,19 +464,109 @@ void ChatPanel::run_turn(const Config &cfg, const std::string &prompt)
         m_messages = saved;
         ui_append(from_u8(m_running ? e.what() : _u8L("Stopped.")) + "\n", ERROR_COLOUR);
     }
+    finish_turn();
+}
+
+void ChatPanel::finish_turn()
+{
     m_running = false;
     // A new turn may have started before this runs.
     CallAfter([this] { if (!m_running) set_busy(false); });
 }
 
+void ChatPanel::kill_claude_code()
+{
+    std::lock_guard<std::mutex> lock(m_kill_mutex);
+    if (m_kill)
+        m_kill();
+}
+
+// Worker thread. One Claude Code run per message; --resume continues the conversation.
+void ChatPanel::run_claude_code(const Config &cfg, const std::string &prompt)
+{
+    namespace bp = boost::process;
+    namespace fs = boost::filesystem;
+    // An empty folder, so Claude Code picks up no project CLAUDE.md.
+    const fs::path dir = fs::path(data_dir()) / "chat";
+    fs::create_directories(dir);
+    const fs::path log = dir / "claude_code_stderr.log";
+
+    const json mcp = {{"mcpServers", {{"bambu", {{"type", "http"}, {"url", "http://127.0.0.1:" + std::to_string(MCP_PORT) + "/mcp"}}}}}};
+    // Only the slicer tools (no shell, files or web), allowed without prompts; no user settings, hooks or plugins.
+    std::vector<std::string> args = {"-p", "--output-format", "stream-json", "--verbose", "--tools", "", "--setting-sources", "",
+                                     "--disable-slash-commands", "--strict-mcp-config", "--mcp-config", mcp.dump(), "--allowedTools", "mcp__bambu",
+                                     "--append-system-prompt", SYSTEM_PROMPT};
+    if (!cfg.model.empty())
+        args.insert(args.end(), {"--model", cfg.model});
+    if (!m_session.empty())
+        args.insert(args.end(), {"--resume", m_session});
+
+    bp::opstream in;
+    bp::ipstream out;
+    bp::child    child(fs::path(cfg.url), bp::args(args), bp::std_in < in, bp::std_out > out, bp::std_err > log, bp::start_dir(dir));
+    {
+        std::lock_guard<std::mutex> lock(m_kill_mutex);
+        m_kill = [&child] { std::error_code ec; child.terminate(ec); };
+        // Stop pressed before m_kill was set.
+        if (!m_running)
+            m_kill();
+    }
+    struct ClearKill
+    {
+        ChatPanel *panel;
+        ~ClearKill() { std::lock_guard<std::mutex> lock(panel->m_kill_mutex); panel->m_kill = nullptr; }
+    } clear_kill{this};
+    // On stdin, so a message starting with '-' is not read as an option.
+    in << prompt;
+    in.flush();
+    in.pipe().close();
+
+    json        result;
+    std::string line;
+    while (std::getline(out, line)) {
+        const json event = json::parse(line, nullptr, false);
+        if (!event.is_object())
+            continue;
+        if (event.contains("session_id") && event["session_id"].is_string())
+            m_session = event["session_id"].get<std::string>();
+        const std::string type = event.value("type", "");
+        if (type == "result")
+            result = event;
+        else if (type == "assistant" && event.contains("message"))
+            for (const json &block : event["message"].value("content", json::array())) {
+                if (block.value("type", "") == "text")
+                    CallAfter([this, text = cfg.speaker() + ": " + from_u8(block.value("text", "")) + "\n"] { append(text); });
+                else if (block.value("type", "") == "tool_use") {
+                    std::string name = block.value("name", "");
+                    if (boost::starts_with(name, "mcp__bambu__"))
+                        name = name.substr(12);
+                    CallAfter([this, text = "-> " + from_u8(name) + "\n"] { append(text, TOOL_COLOUR); });
+                }
+            }
+    }
+    std::error_code ec;
+    child.wait(ec);
+
+    if (!m_running)
+        throw std::runtime_error(_u8L("Stopped."));
+    if (result.is_null()) {
+        std::ifstream     f(log.string());
+        std::stringstream err;
+        err << f.rdbuf();
+        throw std::runtime_error("Claude Code stopped without an answer (exit code " + std::to_string(child.exit_code()) + "): " + err.str().substr(0, 500));
+    }
+    if (result.value("is_error", false))
+        throw std::runtime_error("Claude Code: " + (result.contains("result") && result["result"].is_string() ? result["result"].get<std::string>() : result.value("subtype", "error")));
+}
+
 json ChatPanel::post(const Config &cfg, const json &body)
 {
     std::string response, error;
-    auto http = Http::post(cfg.url + (cfg.provider->anthropic ? "/messages" : "/chat/completions"));
+    auto http = Http::post(cfg.url + (cfg.provider->api == Api::Anthropic ? "/messages" : "/chat/completions"));
     // The app adds Bambu headers (device id, ...) to every request; they are not for this server.
     for (const auto &header : Http::get_extra_headers())
         http.remove_header(header.first);
-    if (cfg.provider->anthropic)
+    if (cfg.provider->api == Api::Anthropic)
         http.header("x-api-key", cfg.key).header("anthropic-version", "2023-06-01");
     else if (!cfg.key.empty())
         http.header("Authorization", "Bearer " + cfg.key);

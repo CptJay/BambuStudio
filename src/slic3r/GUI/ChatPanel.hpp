@@ -2,6 +2,8 @@
 #define slic3r_ChatPanel_hpp_
 
 #include <atomic>
+#include <functional>
+#include <mutex>
 
 #include <boost/thread.hpp>
 #include <wx/panel.h>
@@ -33,6 +35,9 @@ private:
     bool open_settings();
     void update_hint();
     void run_turn(const Config &cfg, const std::string &prompt);
+    void run_claude_code(const Config &cfg, const std::string &prompt);
+    void finish_turn();
+    void kill_claude_code();
     nlohmann::json post(const Config &cfg, const nlohmann::json &body);
     void append(const wxString &text, const wxColour &colour = wxNullColour);
     void set_busy(bool busy);
@@ -44,7 +49,11 @@ private:
     wxButton   *m_new_chat;
 
     nlohmann::json   m_messages = nlohmann::json::array(); // in the current provider's API format
+    std::string      m_session; // Claude Code session to resume
     std::atomic_bool m_running{false};
+    // Ends the running Claude Code process; set by the worker while one runs.
+    std::mutex            m_kill_mutex;
+    std::function<void()> m_kill;
     bool             m_tab_down{false};
     boost::thread    m_worker;
 };
