@@ -9,6 +9,7 @@
 #include <thread>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/process.hpp>
 #include <boost/beast/core.hpp>
@@ -107,12 +108,33 @@ static json get_scene(const json &, const std::atomic_bool &running)
     });
 }
 
+// Tools find objects by name, so new objects get one nobody else has: "<name>", "<name> 2", "<name> 3"... UI thread only.
+static std::string unique_name(const std::string &name, const ModelObject *self = nullptr)
+{
+    const ModelObjectPtrs &objects = wxGetApp().plater()->model().objects;
+    auto taken = [&objects, self](const std::string &n) {
+        return std::any_of(objects.begin(), objects.end(), [&n, self](const ModelObject *o) { return o != self && o->name == n; });
+    };
+    std::string result = name;
+    for (int i = 2; taken(result); ++i)
+        result = name + " " + std::to_string(i);
+    return result;
+}
+
+// Renames an object in the model and in the object list. UI thread only.
+static void rename_object(size_t idx, const std::string &name)
+{
+    wxGetApp().plater()->model().objects[idx]->name = name;
+    ObjectDataViewModel *list = wxGetApp().obj_list()->GetModel();
+    list->SetName(from_u8(name), list->GetItemById(int(idx)));
+}
+
 // Adds the mesh as a new object on a free spot of the plate.
 static json add_mesh_object(const std::atomic_bool &running, const TriangleMesh &mesh, const std::string &name)
 {
     return run_on_ui_thread(running, [mesh, name] {
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Add Primitive");
-        wxGetApp().obj_list()->load_mesh_object(mesh, from_u8(name));
+        wxGetApp().obj_list()->load_mesh_object(mesh, from_u8(unique_name(name)));
         wxGetApp().mainframe->update_title();
         return object_json(wxGetApp().plater()->model().objects.size() - 1);
     });
@@ -231,8 +253,11 @@ static json import_model(const json &args, const std::atomic_bool &running)
         if (idxs.empty())
             throw std::runtime_error("Could not load " + path.string());
         json objects = json::array();
-        for (size_t i : idxs)
+        for (size_t i : idxs) {
+            const ModelObject *obj = wxGetApp().plater()->model().objects[i];
+            rename_object(i, unique_name(obj->name, obj));
             objects.push_back(object_json(i));
+        }
         return json{{"objects", objects}};
     });
 }
@@ -326,9 +351,7 @@ static json duplicate_object(const json &args, const std::atomic_bool &running)
         // Unique names, so later tool calls can tell the copies apart.
         json objects = json::array();
         for (size_t i = first; i < plater->model().objects.size(); ++i) {
-            ModelObject *copy = plater->model().objects[i];
-            copy->name        = name + " " + std::to_string(i - first + 2);
-            wxGetApp().obj_list()->GetModel()->SetName(from_u8(copy->name), wxGetApp().obj_list()->GetModel()->GetItemById(int(i)));
+            rename_object(i, unique_name(name, plater->model().objects[i]));
             objects.push_back(object_json(i));
         }
         return json{{"objects", objects}};
@@ -455,9 +478,11 @@ static json get_settings(const json &args, const std::atomic_bool &running)
     const std::string name = args.value("name", "");
 
     return run_on_ui_thread(running, [keys, name] {
-        PresetBundle            &bundle = *wxGetApp().preset_bundle;
-        const DynamicPrintConfig config = bundle.full_config();
-        const ModelObject       *obj    = name.empty() ? nullptr : wxGetApp().plater()->model().objects[find_object(name)];
+        PresetBundle             &bundle = *wxGetApp().preset_bundle;
+        const DynamicPrintConfig &plate  = *wxGetApp().plater()->get_partplate_list().get_curr_plate()->config();
+        DynamicPrintConfig        config = bundle.full_config();
+        config.apply(plate); // the plate's own settings win, as in BackgroundSlicingProcess::apply()
+        const ModelObject        *obj    = name.empty() ? nullptr : wxGetApp().plater()->model().objects[find_object(name)];
 
         json settings = json::object();
         for (const std::string &key : keys.empty() ? COMMON_SETTINGS : keys.get<std::vector<std::string>>()) {
@@ -465,10 +490,9 @@ static json get_settings(const json &args, const std::atomic_bool &running)
             const ConfigOption *opt         = from_object ? obj->config.option(key) : config.option(key);
             if (opt == nullptr)
                 throw std::invalid_argument("Unknown setting: " + key);
-            json entry = {{"value", opt->serialize()}, {"label", print_config_def.get(key)->label}};
-            if (obj != nullptr)
-                entry["source"] = from_object ? "object" : "plate";
-            settings[key] = entry;
+            settings[key] = {{"value", opt->serialize()},
+                             {"label", print_config_def.get(key)->label},
+                             {"source", from_object ? "object" : plate.has(key) ? "plate" : "preset"}};
         }
         return json{{"presets", {{"printer", preset_label(bundle.printers)},
                                  {"process", preset_label(bundle.prints)},
@@ -547,6 +571,62 @@ static json select_process_preset(const json &args, const std::atomic_bool &runn
         wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
         return json{{"process", preset_label(prints)}};
     });
+}
+
+// Checks a project path from a tool: absolute, a plain .3mf (a .gcode.3mf opens in preview-only mode), and no characters
+// the app refuses with a warning dialog (the path is shown in the home page's recent list).
+static boost::filesystem::path project_path_arg(const json &args)
+{
+    const boost::filesystem::path path(args.value("path", ""));
+    const std::string             text = path.string();
+    if (!path.is_absolute() || !boost::iends_with(text, ".3mf") || boost::iends_with(text, ".gcode.3mf"))
+        throw std::invalid_argument("path must be an absolute path ending in .3mf (not .gcode.3mf)");
+    if (Plater::has_html_unsafe_path_characters(text))
+        throw std::invalid_argument("path must not contain quotes or angle brackets");
+    return path;
+}
+
+static json save_project(const json &args, const std::atomic_bool &running)
+{
+    namespace fs = boost::filesystem;
+    const fs::path path = project_path_arg(args);
+    if (!fs::is_directory(path.parent_path()))
+        throw std::invalid_argument("Folder does not exist: " + path.parent_path().string());
+    if (fs::exists(path) && !args.value("overwrite", false))
+        throw std::invalid_argument("File already exists: " + path.string() + " (set overwrite to replace it)");
+
+    return run_on_ui_thread(running, [path] {
+        Plater        *plater   = wxGetApp().plater();
+        const wxString previous = plater->get_project_filename(".3mf");
+        // With a project file name set, the app's own Save writes there without a file dialog.
+        plater->set_project_filename(from_u8(path.string()));
+        if (plater->save_project() != wxID_YES) {
+            plater->set_project_filename(previous);
+            throw std::runtime_error("Failed to save " + path.string());
+        }
+        return json{{"path", path.string()}};
+    });
+}
+
+static json open_project(const json &args, const std::atomic_bool &running)
+{
+    const boost::filesystem::path path = project_path_arg(args);
+    if (!boost::filesystem::is_regular_file(path))
+        throw std::invalid_argument("No such file: " + path.string());
+
+    run_on_ui_thread(running, [path] {
+        Plater *plater = wxGetApp().plater();
+        // Otherwise the app asks to save first; refuse rather than wait on that dialog or lose the user's work.
+        if (!plater->up_to_date(false, false) || wxGetApp().has_current_preset_changes())
+            throw std::runtime_error("The current project has unsaved changes. Use save_project first, "
+                                     "or save or discard them in BambuStudio.");
+        if (plater->load_project(from_u8(path.string())) == wxID_CANCEL)
+            throw std::runtime_error("Could not open " + path.string());
+        return json();
+    });
+    json scene       = get_scene(json(), running);
+    scene["project"] = path.string();
+    return scene;
 }
 
 // Plate coordinates, so an OpenSCAD import() lines up with the bounding boxes from get_scene.
@@ -674,6 +754,11 @@ static json slice(const json &, const std::atomic_bool &running)
 {
     run_on_ui_thread(running, [] {
         Plater *plater = wxGetApp().plater();
+        // A project opened by a tool can bring shell commands that run after slicing, and the app skips its warning when
+        // the user once ticked "remember my choice". Tools never slice those; the user does it in BambuStudio.
+        const std::vector<std::string> scripts = wxGetApp().preset_bundle->full_config().option<ConfigOptionStrings>("post_process")->values;
+        if (std::any_of(scripts.begin(), scripts.end(), [](const std::string &s) { return !boost::trim_copy(s).empty(); }))
+            throw std::runtime_error("This project has post-processing scripts; slice it in BambuStudio instead");
         plater->exit_gizmo();
         plater->update(true, true);
         bool model_fits = false, validate_error = false;
@@ -820,7 +905,7 @@ static const std::vector<McpTool> &tools()
          add_text},
         {"get_settings",
          "Read the selected presets and print settings. Without keys, returns common ones (layer height, walls, infill, supports, "
-         "brim...). With an object name, shows that object's overrides (source \"object\") and the plate values for the rest.",
+         "brim...). Each value's source is \"preset\", \"plate\" (this plate's own settings) or \"object\" (with an object name).",
          {{"type", "object"},
           {"properties",
            {{"keys", {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Setting names, e.g. [\"wall_loops\"]"}}},
@@ -842,6 +927,21 @@ static const std::vector<McpTool> &tools()
          "Printer and filament presets are chosen in BambuStudio.",
          {{"type", "object"}, {"properties", {{"preset", {{"type", "string"}}}}}, {"required", json::array({"preset"})}},
          select_process_preset},
+        {"save_project",
+         "Save the whole project (objects, plates, settings) as a BambuStudio .3mf, like File > Save Project As. "
+         "It becomes the current project file.",
+         {{"type", "object"},
+          {"properties",
+           {{"path", {{"type", "string"}, {"description", "Absolute path ending in .3mf"}}},
+            {"overwrite", {{"type", "boolean"}, {"default", false}}}}},
+          {"required", json::array({"path"})}},
+         save_project},
+        {"open_project",
+         "Open a BambuStudio .3mf project, replacing the current one. Refused while the current project has unsaved changes.",
+         {{"type", "object"},
+          {"properties", {{"path", {{"type", "string"}, {"description", "Absolute path ending in .3mf"}}}}},
+          {"required", json::array({"path"})}},
+         open_project},
         {"export_object",
          "Save an object as a binary STL, in plate coordinates (they match get_scene's bounding boxes). "
          "Use it with render_openscad's import() to edit existing objects.",
@@ -852,7 +952,7 @@ static const std::vector<McpTool> &tools()
             {"overwrite", {{"type", "boolean"}, {"default", false}}}}},
           {"required", json::array({"name", "path"})}},
          export_object},
-        {"duplicate_object", "Make copies of an object, placed on free spots. Copies are named \"<name> 2\", \"<name> 3\"...",
+        {"duplicate_object", "Make copies of an object, placed on free spots. Copies get the next free names: \"<name> 2\", \"<name> 3\"...",
          {{"type", "object"},
           {"properties", {{"name", {{"type", "string"}}}, {"copies", {{"type", "integer"}, {"default", 1}}}}},
           {"required", json::array({"name"})}},
