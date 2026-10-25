@@ -1738,6 +1738,7 @@ void GLCanvas3D::on_change_color_mode(bool is_dark, bool reinit) {
                 p_main_toolbar->set_icon_dirty();
             }
             wxGetApp().plater()->get_collapse_toolbar().set_icon_dirty();
+            wxGetApp().plater()->get_chat_toolbar().set_icon_dirty();
         }
     }
     if (m_canvas_type == CanvasAssembleView) {
@@ -3049,6 +3050,8 @@ void GLCanvas3D::render(bool only_init)
 
 	    if (tooltip.empty())
             tooltip = wxGetApp().plater()->get_collapse_toolbar().get_tooltip();
+        if (tooltip.empty())
+            tooltip = wxGetApp().plater()->get_chat_toolbar().get_tooltip();
 
         // Show tip when hovering an unprintable object volume.
         if (tooltip.empty() && !m_hover_volume_idxs.empty()) {
@@ -4381,6 +4384,7 @@ bool GLCanvas3D::_do_idle_work()
         wxGetApp().plater()->sidebar().cancel_update_3d_state();
     }
     m_dirty |= wxGetApp().plater()->get_collapse_toolbar().update_items_state();
+    m_dirty |= wxGetApp().plater()->get_chat_toolbar().update_items_state();
     bool mouse3d_controller_applied = wxGetApp().plater()->get_mouse3d_controller().apply(get_active_camera());
     m_dirty |= mouse3d_controller_applied;
     m_dirty |= wxGetApp().plater()->get_notification_manager()->update_notifications(*this);
@@ -4961,6 +4965,7 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                 else if (m_tab_down && keyCode == WXK_TAB && !evt.HasAnyModifiers()) {
                     // Enable switching between 3D and Preview with Tab
                     // m_canvas->HandleAsNavigationKey(evt);   // XXX: Doesn't work in some cases / on Linux
+                    m_tab_down = false; // so a later release, of a Tab pressed elsewhere (chat pane), is ignored
                     post_event(SimpleEvent(EVT_GLCANVAS_TAB));
                 }
                 else if (keyCode == WXK_SHIFT) {
@@ -5551,7 +5556,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         }
     }
 
-    if (wxGetApp().plater()->get_collapse_toolbar().on_mouse(evt, *this)) {
+    if (wxGetApp().plater()->get_collapse_toolbar().on_mouse(evt, *this) ||
+        (m_canvas_type != CanvasAssembleView && wxGetApp().plater()->get_chat_toolbar().on_mouse(evt, *this))) {
         if (evt.LeftUp() || evt.MiddleUp() || evt.RightUp())
             mouse_up_cleanup();
         m_mouse.set_start_position_3D_as_invalid();
@@ -7813,6 +7819,7 @@ void GLCanvas3D::_switch_toolbars_icon_filename()
     }
 
     wxGetApp().plater()->get_collapse_toolbar().init(background_data);
+    wxGetApp().plater()->get_chat_toolbar().init(background_data);
 
 }
 bool GLCanvas3D::_init_toolbars()
@@ -9258,6 +9265,7 @@ void GLCanvas3D::_check_and_update_toolbar_icon_scale()
     }
 
     collapse_toolbar.set_scale(sc);
+    wxGetApp().plater()->get_chat_toolbar().set_scale(sc);
     size *= m_retina_helper->get_scale_factor();
 
     auto* m_notification = wxGetApp().plater()->get_notification_manager();
@@ -9268,6 +9276,7 @@ void GLCanvas3D::_check_and_update_toolbar_icon_scale()
         p_main_toolbar->set_icons_size(size);
     }
     collapse_toolbar.set_icons_size(wxGetApp().plater()->get_collapse_toolbar_size());
+    wxGetApp().plater()->get_chat_toolbar().set_icons_size(wxGetApp().plater()->get_collapse_toolbar_size());
 #endif // ENABLE_RETINA_GL
     // Update collapse toolbar
     collapse_toolbar.set_enabled(wxGetApp().plater()->get_sidebar_docking_state() != Sidebar::None);
@@ -9333,6 +9342,7 @@ void GLCanvas3D::_render_overlays()
      _render_assemble_control();
 
      _render_toolbar();
+     _render_chat_toggle();
 
     if (m_layers_editing.last_object_id >= 0 && m_layers_editing.object_max_z() > 0.0f)
         m_layers_editing.render_overlay(*this);
@@ -10418,6 +10428,13 @@ void GLCanvas3D::_render_return_toolbar()
     ImGui::PopStyleVar(1);
 
     imgui.end();
+}
+
+void GLCanvas3D::_render_chat_toggle()
+{
+    if (m_canvas_type == ECanvasType::CanvasAssembleView)
+        return;
+    wxGetApp().plater()->get_chat_toolbar().render(get_active_camera());
 }
 
 void GLCanvas3D::_render_fit_camera_toolbar()

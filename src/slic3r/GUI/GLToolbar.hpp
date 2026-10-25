@@ -307,6 +307,7 @@ struct ToolbarLayout
     {
         TopLeft,
         TopMiddle,
+        TopRight,
         Custom
     };
 

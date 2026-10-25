@@ -230,6 +230,7 @@ void KBShortcutsDialog::fill_shortcuts()
             //{ "R", L("Auto orientates selected objects or all objects.If there are selected objects, it just orientates the selected ones.Otherwise, it will orientates all objects in the project.") },
             {L("Shift+R"), L("Auto orientates selected objects or all objects.If there are selected objects, it just orientates the selected ones.Otherwise, it will orientates all objects in the current disk.")},
 
+            {"Tab", L("Show/Hide the chat pane")},
             {L("Shift+Tab"), L("Collapse/Expand the sidebar")},
             {L(ctrl+"Any arrow"), L("Movement in camera space")},
             {L(alt+"Left mouse button"), L("Select a part")},

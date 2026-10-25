@@ -100,6 +100,7 @@
 #include "GUI_App.hpp"
 #include "GuiColor.hpp"
 #include "GUI_ObjectList.hpp"
+#include "ChatPanel.hpp"
 #include "GUI_Utils.hpp"
 #include "GUI_Factories.hpp"
 #include "wxExtensions.hpp"
@@ -6700,6 +6701,7 @@ public:
     // PIMPL back pointer ("Q-Pointer")
     Plater *q;
     Sidebar *  sidebar;
+    ChatPanel *chat_panel;
     AuiMgr                 m_aui_mgr;
     wxString               m_default_window_layout;
     struct SidebarLayout
@@ -6765,6 +6767,7 @@ public:
     // BBS
     //GLToolbar view_toolbar;
     GLToolbar collapse_toolbar;
+    GLToolbar chat_toolbar;
     Preview *preview;
     AssembleView* assemble_view { nullptr };
     std::unique_ptr<NotificationManager> notification_manager;
@@ -7503,6 +7506,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     , m_job_prepare_state(Job::JobPrepareState::PREPARE_STATE_DEFAULT)
     , delayed_scene_refresh(false)
     , collapse_toolbar(GLToolbar::EType::Normal, "Collapse")
+    , chat_toolbar(GLToolbar::EType::Normal, "Chat")
     //BBS :partplatelist construction
     , partplate_list(this->q, &model)
 {
@@ -7608,6 +7612,20 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
                                    .Resizable(true)
                                    .MinSize(wxSize(15 * wxGetApp().em_unit(), 90 * wxGetApp().em_unit()))
                                    .BestSize(wxSize(42 * wxGetApp().em_unit(), 90 * wxGetApp().em_unit())));
+
+    chat_panel = new ChatPanel(q);
+    // Hidden by default; a saved layout without it (older versions) also leaves it hidden.
+    m_aui_mgr.AddPane(chat_panel, wxAuiPaneInfo()
+                                      .Name("chat")
+                                      .Right()
+                                      .Layer(1)
+                                      .CaptionVisible(false)
+                                      .CloseButton(false)
+                                      .Floatable(false)
+                                      .Resizable(true)
+                                      .MinSize(wxSize(25 * wxGetApp().em_unit(), -1))
+                                      .BestSize(wxSize(40 * wxGetApp().em_unit(), -1))
+                                      .Hide());
 
     auto *panel_sizer = new wxBoxSizer(wxHORIZONTAL);
     panel_sizer->Add(view3D, 1, wxEXPAND | wxALL, 0);
@@ -7734,7 +7752,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         view3D_canvas->Bind(EVT_GLCANVAS_UPDATE_GEOMETRY, &priv::on_update_geometry, this);
         view3D_canvas->Bind(EVT_GLCANVAS_MOUSE_DRAGGING_STARTED, &priv::on_3dcanvas_mouse_dragging_started, this);
         view3D_canvas->Bind(EVT_GLCANVAS_MOUSE_DRAGGING_FINISHED, &priv::on_3dcanvas_mouse_dragging_finished, this);
-        view3D_canvas->Bind(EVT_GLCANVAS_TAB, [this](SimpleEvent&) { select_next_view_3D(); });
+        view3D_canvas->Bind(EVT_GLCANVAS_TAB, [this](SimpleEvent&) { this->q->toggle_chat_pane(); });
         view3D_canvas->Bind(EVT_GLCANVAS_RESETGIZMOS, [this](SimpleEvent&) { reset_all_gizmos(); });
         view3D_canvas->Bind(EVT_GLCANVAS_UNDO, [this](SimpleEvent&) { this->undo(); });
         view3D_canvas->Bind(EVT_GLCANVAS_REDO, [this](SimpleEvent&) { this->redo(); });
@@ -7804,7 +7822,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
             preview->get_canvas3d()->set_as_dirty();
         });
     if (wxGetApp().is_editor()) {
-        preview->get_wxglcanvas()->Bind(EVT_GLCANVAS_TAB, [this](SimpleEvent &) { select_next_view_3D(); });
+        preview->get_wxglcanvas()->Bind(EVT_GLCANVAS_TAB, [this](SimpleEvent &) { this->q->toggle_chat_pane(); });
         preview->get_wxglcanvas()->Bind(EVT_GLCANVAS_COLLAPSE_SIDEBAR, [this](SimpleEvent&) { this->q->collapse_sidebar(!this->q->is_sidebar_collapsed());  });
         preview->get_wxglcanvas()->Bind(EVT_CUSTOMEVT_TICKSCHANGED, [this](wxCommandEvent& event) {
             CustomGCode::Type tick_event_type = (CustomGCode::Type)event.GetInt();
@@ -17905,17 +17923,22 @@ bool Plater::priv::init_collapse_toolbar()
     background_data.right = 4;
     background_data.bottom = 4;
 
-    if (!collapse_toolbar.init(background_data))
+    // The chat pane's toggle on the right looks the same as the sidebar's on the left.
+    auto init_toolbar = [&background_data](GLToolbar &toolbar, ToolbarLayout::EPositionMode position) {
+        if (!toolbar.init(background_data))
+            return false;
+        toolbar.set_layout_type(ToolbarLayout::EType::Vertical);
+        toolbar.set_horizontal_orientation(ToolbarLayout::HO_Right);
+        toolbar.set_vertical_orientation(ToolbarLayout::VO_Top);
+        toolbar.set_border(0.0f);
+        toolbar.set_separator_size(5);
+        toolbar.set_gap_size(2);
+        toolbar.del_all_item();
+        toolbar.set_position_mode(position);
+        return true;
+    };
+    if (!init_toolbar(collapse_toolbar, ToolbarLayout::EPositionMode::TopLeft) || !init_toolbar(chat_toolbar, ToolbarLayout::EPositionMode::TopRight))
         return false;
-
-    collapse_toolbar.set_layout_type(ToolbarLayout::EType::Vertical);
-    collapse_toolbar.set_horizontal_orientation(ToolbarLayout::HO_Right);
-    collapse_toolbar.set_vertical_orientation(ToolbarLayout::VO_Top);
-    collapse_toolbar.set_border(0.0f);
-    collapse_toolbar.set_separator_size(5);
-    collapse_toolbar.set_gap_size(2);
-    collapse_toolbar.del_all_item();
-    collapse_toolbar.set_position_mode(ToolbarLayout::EPositionMode::TopLeft);
 
     GLToolbarItem::Data item;
 
@@ -17935,6 +17958,17 @@ bool Plater::priv::init_collapse_toolbar()
     // is updated before the toolbar is first used.
     wxGetApp().plater()->collapse_sidebar(wxGetApp().plater()->is_sidebar_collapsed());
     collapse_toolbar.set_icons_size(q->get_collapse_toolbar_size());
+
+    GLToolbarItem::Data chat_item;
+    chat_item.name                   = "toggle_chat";
+    chat_item.icon_filename_callback = [](bool) -> std::string { return "collapse.svg"; };
+    chat_item.sprite_id              = 0;
+    chat_item.left.action_callback   = []() { wxGetApp().plater()->toggle_chat_pane(); };
+    if (!chat_toolbar.add_item(chat_item))
+        return false;
+    chat_toolbar.set_tooltip(chat_toolbar.get_item_id("toggle_chat"), (q->is_chat_pane_shown() ? _u8L("Collapse chat") : _u8L("Expand chat")) + " [Tab]");
+    chat_toolbar.set_icons_size(q->get_collapse_toolbar_size());
+    chat_toolbar.set_enabled(true); // toolbars start disabled
     return true;
 }
 
@@ -22737,6 +22771,22 @@ void Plater::show_view3D_overhang(bool show)  {  p->show_view3D_overhang(show); 
 
 bool Plater::is_sidebar_enabled() const { return p->sidebar_layout.is_enabled; }
 void Plater::enable_sidebar(bool enabled) { p->enable_sidebar(enabled); }
+bool Plater::is_chat_pane_shown() const { return p->m_aui_mgr.GetPane(p->chat_panel).IsShown(); }
+
+void Plater::toggle_chat_pane()
+{
+    const bool show = !is_chat_pane_shown();
+    p->m_aui_mgr.GetPane(p->chat_panel).Show(show);
+    p->m_aui_mgr.Update();
+    p->chat_toolbar.set_tooltip(p->chat_toolbar.get_item_id("toggle_chat"), (show ? _u8L("Collapse chat") : _u8L("Expand chat")) + " [Tab]");
+    if (show)
+        p->chat_panel->focus_input();
+    else if (GLCanvas3D *canvas = get_current_canvas3D())
+        canvas->get_wxglcanvas()->SetFocus();
+    if (GLCanvas3D *canvas = get_current_canvas3D())
+        canvas->set_as_dirty();
+}
+
 bool Plater::is_sidebar_collapsed() const { return p->sidebar_layout.is_collapsed; }
 void Plater::collapse_sidebar(bool show) { p->collapse_sidebar(show); }
 Sidebar::DockingState Plater::get_sidebar_docking_state() const { return p->get_sidebar_docking_state(); }
@@ -27625,6 +27675,8 @@ GLToolbar& Plater::get_collapse_toolbar()
 {
     return p->collapse_toolbar;
 }
+
+GLToolbar& Plater::get_chat_toolbar() { return p->chat_toolbar; }
 
 int Plater::get_collapse_toolbar_size() {
     return 20;
