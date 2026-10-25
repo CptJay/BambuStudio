@@ -35,6 +35,7 @@
 #include "Selection.hpp"
 #include "BackgroundSlicingProcess.hpp"
 #include "Tab.hpp"
+#include "PresetComboBoxes.hpp"
 #include "GUI_Factories.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "ObjectDataViewModel.hpp"
@@ -97,7 +98,17 @@ static json object_json(size_t idx)
         BoundingBoxf3 bb = obj->instance_bounding_box(i);
         instances.push_back({{"min", to_json(bb.min)}, {"max", to_json(bb.max)}, {"size", to_json(bb.size())}});
     }
-    return {{"index", idx}, {"name", obj->name}, {"instances", instances}};
+    // Filament slot, 1-based; 0 or unset means the default, slot 1.
+    const int filament = obj->config.has("extruder") ? std::max(obj->config.opt_int("extruder"), 1) : 1;
+    json      result   = {{"index", idx}, {"name", obj->name}, {"filament", filament}, {"instances", instances}};
+    // Parts set to another slot in the app make this a multi-color object (painted colors are not listed).
+    json parts = json::array();
+    for (const ModelVolume *v : obj->volumes)
+        if (v->is_model_part() && v->config.has("extruder") && v->config.opt_int("extruder") > 0 && v->config.opt_int("extruder") != filament)
+            parts.push_back({{"part", v->name}, {"filament", v->config.opt_int("extruder")}});
+    if (!parts.empty())
+        result["part_filaments"] = parts;
+    return result;
 }
 
 static json get_scene(const json &, const std::atomic_bool &running)
@@ -207,6 +218,17 @@ static json render_openscad(const json &args, const std::atomic_bool &running)
     return result;
 }
 
+// Undo and the 3D renders only work in the 3D editor, and slice leaves the app on the Preview tab.
+// The switch completes in later UI events, so callers use the editor in a separate step.
+static void show_3d_editor(const std::atomic_bool &running)
+{
+    run_on_ui_thread(running, [] {
+        wxGetApp().mainframe->select_tab(size_t(MainFrame::tp3DEditor));
+        wxGetApp().plater()->select_view_3D("3D");
+        return json();
+    });
+}
+
 // Returns an MCP tool result (not plain JSON) so the client receives an image.
 static json get_view(const json &args, const std::atomic_bool &running)
 {
@@ -220,6 +242,7 @@ static json get_view(const json &args, const std::atomic_bool &running)
     if (size < 64 || size > 2048)
         throw std::invalid_argument("size must be between 64 and 2048");
 
+    show_3d_editor(running); // rendered from the Preview tab, the picture comes out blank
     return run_on_ui_thread(running, [angle = view->second, size] {
         Plater *plater = wxGetApp().plater();
         // Framed on the objects (use_plate_box = false) so small parts are not lost on a big plate.
@@ -446,6 +469,22 @@ static const std::vector<std::string> COMMON_SETTINGS = {
     "layer_height",    "initial_layer_print_height", "wall_loops", "top_shell_layers", "bottom_shell_layers", "sparse_infill_density",
     "sparse_infill_pattern", "enable_support",       "support_type", "brim_type",      "ironing_type",        "print_sequence"};
 
+// The filament slots in the sidebar (AMS slots on Bambu printers), 1-based. UI thread only.
+static json filaments_json()
+{
+    const PresetBundle            &bundle = *wxGetApp().preset_bundle;
+    const std::vector<std::string> colors = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    json                           slots  = json::array();
+    for (size_t i = 0; i < bundle.filament_presets.size(); ++i) {
+        const Preset *preset = bundle.filaments.find_preset(bundle.filament_presets[i], false);
+        slots.push_back({{"slot", i + 1},
+                         {"preset", bundle.filament_presets[i]},
+                         {"type", preset ? preset->config.opt_string("filament_type", 0u) : ""},
+                         {"color", i < colors.size() ? colors[i] : ""}});
+    }
+    return slots;
+}
+
 static std::string preset_label(const PresetCollection &presets)
 {
     return presets.get_edited_preset().name + (presets.current_is_dirty() ? " (modified)" : "");
@@ -498,7 +537,7 @@ static json get_settings(const json &args, const std::atomic_bool &running)
         }
         return json{{"presets", {{"printer", preset_label(bundle.printers)},
                                  {"process", preset_label(bundle.prints)},
-                                 {"filaments", bundle.filament_presets}}},
+                                 {"filaments", filaments_json()}}},
                     {"settings", settings}};
     });
 }
@@ -572,6 +611,79 @@ static json select_process_preset(const json &args, const std::atomic_bool &runn
         wxGetApp().get_tab(Preset::TYPE_PRINT)->select_preset(name);
         wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
         return json{{"process", preset_label(prints)}};
+    });
+}
+
+static json set_object_filament(const json &args, const std::atomic_bool &running)
+{
+    const std::string name     = args.value("name", "");
+    const int         filament = args.value("filament", 0);
+    return run_on_ui_thread(running, [name, filament] {
+        const size_t count = wxGetApp().preset_bundle->filament_presets.size();
+        if (filament < 1 || size_t(filament) > count)
+            throw std::invalid_argument("filament must be a slot from 1 to " + std::to_string(count));
+        const size_t idx  = find_object(name);
+        ObjectList  *list = wxGetApp().obj_list();
+        // The app's own "Change filament" action, which works on the object list's selection.
+        list->select_item(list->GetModel()->GetItemById(int(idx)));
+        list->set_extruder_for_selected_items(filament);
+        return object_json(idx);
+    });
+}
+
+// shortcut: switches a slot's preset through its sidebar dropdown, as a click would, so the app's whole preset-change handler
+// runs; filament colors and filament settings (temperatures...) are still changed in BambuStudio.
+static json select_filament(const json &args, const std::atomic_bool &running)
+{
+    const int         slot = args.value("slot", 0);
+    const std::string name = args.value("preset", "");
+    return run_on_ui_thread(running, [slot, name] {
+        PresetBundle &bundle  = *wxGetApp().preset_bundle;
+        Sidebar      &sidebar = wxGetApp().plater()->sidebar();
+        const int     count   = int(bundle.filament_presets.size());
+        if (slot < 1 || slot > count + 1)
+            throw std::invalid_argument("slot must be from 1 to " + std::to_string(count) + ", or " + std::to_string(count + 1) +
+                                        " to add a slot");
+        // With unsaved filament edits the app may ask to save or discard them; refuse rather than wait or lose them.
+        if (bundle.filaments.current_is_dirty())
+            throw std::runtime_error("A filament preset has unsaved changes. Save or discard them in BambuStudio first.");
+        const Preset *preset = bundle.filaments.find_preset(name, false);
+        if (preset == nullptr || !preset->is_visible || !preset->is_compatible) {
+            std::string available;
+            for (const Preset &p : bundle.filaments)
+                if (p.is_visible && p.is_compatible)
+                    available += (available.empty() ? "" : ", ") + p.name;
+            throw std::invalid_argument("No filament preset named \"" + name + "\" for this printer. Available: " + available);
+        }
+
+        // Dropdown entries show aliases with an optional "(modified)" suffix; map each back to its preset name.
+        auto entry_of = [&bundle, &name](PlaterPresetComboBox *combo) {
+            for (unsigned i = 0; i < combo->GetCount(); ++i)
+                if (bundle.get_preset_name_by_alias(Preset::TYPE_FILAMENT, Preset::remove_suffix_modified(combo->GetString(i).ToUTF8().data())) == name)
+                    return int(i);
+            return -1;
+        };
+        // Look the entry up before adding a slot, so a failure leaves the slots as they were.
+        if (entry_of(sidebar.combos_filament().front()) < 0)
+            throw std::runtime_error("BambuStudio's filament list has no entry for \"" + name + "\"");
+        if (slot == count + 1) {
+            sidebar.add_filament();
+            if (int(bundle.filament_presets.size()) != slot)
+                throw std::runtime_error("BambuStudio cannot add more filament slots");
+        }
+
+        PlaterPresetComboBox *combo = sidebar.combos_filament()[slot - 1];
+        const int             entry = entry_of(combo);
+        if (entry < 0)
+            throw std::runtime_error("BambuStudio's filament list has no entry for \"" + name + "\"");
+        combo->SetSelection(entry);
+        wxCommandEvent evt(wxEVT_COMBOBOX, combo->GetId());
+        evt.SetEventObject(combo);
+        evt.SetInt(entry);
+        combo->GetEventHandler()->ProcessEvent(evt);
+        if (bundle.filament_presets[slot - 1] != name)
+            throw std::runtime_error("BambuStudio did not switch slot " + std::to_string(slot) + "; check the app for a message");
+        return json{{"filaments", filaments_json()}};
     });
 }
 
@@ -687,13 +799,7 @@ static json delete_objects(const json &args, const std::atomic_bool &running)
 
 static json undo(const json &, const std::atomic_bool &running)
 {
-    // The app only undoes in the 3D editor tab, and slice leaves it on the Preview tab.
-    // The switch completes in later UI events, so undo in a separate step.
-    run_on_ui_thread(running, [] {
-        wxGetApp().mainframe->select_tab(size_t(MainFrame::tp3DEditor));
-        wxGetApp().plater()->select_view_3D("3D");
-        return json();
-    });
+    show_3d_editor(running);
     const json undone = run_on_ui_thread(running, [] {
         Plater *plater = wxGetApp().plater();
         if (!plater->can_undo())
@@ -981,6 +1087,19 @@ static const std::vector<McpTool> &tools()
          "Printer and filament presets are chosen in BambuStudio.",
          {{"type", "object"}, {"properties", {{"preset", {{"type", "string"}}}}}, {"required", json::array({"preset"})}},
          select_process_preset},
+        {"set_object_filament",
+         "Print an object with a filament slot (1-based; see get_settings for the slots, their presets and colors).",
+         {{"type", "object"},
+          {"properties", {{"name", {{"type", "string"}}}, {"filament", {{"type", "integer"}, {"description", "Filament slot, 1-based"}}}}},
+          {"required", json::array({"name", "filament"})}},
+         set_object_filament},
+        {"select_filament",
+         "Choose the filament preset of a slot (e.g. \"Bambu PETG Basic @BBL A1\"). Use slot = number of slots + 1 to add a slot. "
+         "An unknown name returns the available presets. Colors and filament settings are changed in BambuStudio.",
+         {{"type", "object"},
+          {"properties", {{"slot", {{"type", "integer"}, {"description", "1-based"}}}, {"preset", {{"type", "string"}}}}},
+          {"required", json::array({"slot", "preset"})}},
+         select_filament},
         {"save_project",
          "Save the whole project (objects, plates, settings) as a BambuStudio .3mf, like File > Save Project As. "
          "It becomes the current project file.",

@@ -15,7 +15,8 @@ from pathlib import Path
 URL = "http://127.0.0.1:13619/mcp"
 TOOLS = {"get_scene", "add_shape", "render_openscad", "get_view", "import_model", "delete_objects", "add_text",
          "export_object", "transform_object", "duplicate_object", "arrange", "slice", "export_gcode",
-         "get_settings", "set_settings", "select_process_preset", "undo", "save_project", "open_project", "orient"}
+         "get_settings", "set_settings", "select_process_preset", "undo", "save_project", "open_project", "orient",
+         "set_object_filament", "select_filament"}
 
 
 def fail(message):
@@ -89,6 +90,15 @@ def main():
         if not process.endswith("(modified)"):
             call("select_process_preset", {"preset": process})
         call("select_process_preset", {"preset": "No Such Preset"}, expect_error=True)
+
+        # Filament: only checks that change nothing (re-select slot 1's own preset, use slot 1), so the user's slots stay.
+        slots = call("get_settings")["presets"]["filaments"]
+        check(slots and slots[0]["slot"] == 1 and slots[0]["preset"], f"filament slots {slots}")
+        call("select_filament", {"slot": 1, "preset": slots[0]["preset"]})
+        call("select_filament", {"slot": 1, "preset": "No Such Filament"}, expect_error=True)
+        call("select_filament", {"slot": len(slots) + 2, "preset": slots[0]["preset"]}, expect_error=True)
+        check(call("set_object_filament", {"name": "smoke box", "filament": 1})["filament"] == 1, "set_object_filament")
+        call("set_object_filament", {"name": "smoke box", "filament": len(slots) + 1}, expect_error=True)
         changed = call("set_settings", {"name": "smoke box", "values": {"wall_loops": 3, "sparse_infill_density": "30%"}})
         check(changed["settings"]["wall_loops"] == {"label": "Wall loops", "value": "3", "source": "object"}, f"set_settings {changed}")
         call("set_settings", {"name": "smoke box", "values": {"wall_loops": 4, "sparse_infill_pattern": "spaghetti"}}, expect_error=True)
@@ -121,6 +131,9 @@ def main():
         # Undo right after slicing: the app is on the Preview tab then.
         call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "undo me"})
         call("slice")
+        # The app is on the Preview tab now; a 3D render from there used to come out blank (a ~650-byte PNG).
+        after_slice = call("get_view", {"view": "iso", "size": 128})
+        check(len(after_slice["data"]) > 2000, "get_view after slice returned a blank image")
         undone = call("undo")
         check(undone["undone"] == "Add Primitive" and all(o["name"] != "undo me" for o in undone["objects"]), f"undo {undone}")
         for name in ("plate.gcode", "plate.gcode.3mf"):
