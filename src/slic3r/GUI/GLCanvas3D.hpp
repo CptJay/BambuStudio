@@ -1434,6 +1434,7 @@ private:
 
     void _render_return_toolbar();
     void _render_fit_camera_toolbar();
+    void _render_chat_toggle();
     void _render_collapse_toolbar() const;
     // BBS
     //void _render_view_toolbar() const;

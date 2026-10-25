@@ -1170,6 +1170,27 @@ static json tool_result(const std::string &text, bool is_error)
     return {{"content", content}, {"isError", is_error}};
 }
 
+json mcp_tool_list()
+{
+    json list = json::array();
+    for (const McpTool &tool : tools())
+        list.push_back({{"name", tool.name}, {"description", tool.description}, {"inputSchema", tool.input_schema}});
+    return list;
+}
+
+json mcp_call_tool(const std::string &name, const json &args, const std::atomic_bool &running)
+{
+    auto tool = std::find_if(tools().begin(), tools().end(), [&name](const McpTool &t) { return name == t.name; });
+    if (tool == tools().end())
+        return tool_result("Unknown tool: " + name, true);
+    try {
+        const json out = tool->run(args, running);
+        return out.contains("content") ? out : tool_result(out.dump(2), false);
+    } catch (const std::exception &e) {
+        return tool_result(e.what(), true);
+    }
+}
+
 // Returns the JSON-RPC response, or null for a notification (which gets no response).
 static json handle_rpc(const json &req, const std::atomic_bool &running)
 {
@@ -1188,26 +1209,16 @@ static json handle_rpc(const json &req, const std::atomic_bool &running)
                                {"serverInfo", {{"name", "bambustudio"}, {"version", SLIC3R_VERSION}}}});
     if (method == "ping")
         return rpc_result(id, json::object());
-    if (method == "tools/list") {
-        json list = json::array();
-        for (const McpTool &tool : tools())
-            list.push_back({{"name", tool.name}, {"description", tool.description}, {"inputSchema", tool.input_schema}});
-        return rpc_result(id, {{"tools", list}});
-    }
+    if (method == "tools/list")
+        return rpc_result(id, {{"tools", mcp_tool_list()}});
     if (method == "tools/call") {
         const std::string name = params.value("name", "");
-        auto tool = std::find_if(tools().begin(), tools().end(), [&name](const McpTool &t) { return name == t.name; });
-        if (tool == tools().end())
+        if (std::none_of(tools().begin(), tools().end(), [&name](const McpTool &t) { return name == t.name; }))
             return rpc_error(id, -32602, "Unknown tool: " + name);
         const json args = params.contains("arguments") ? params["arguments"] : json::object();
         if (!args.is_object())
             return rpc_error(id, -32602, "arguments must be an object");
-        try {
-            const json out = tool->run(args, running);
-            return rpc_result(id, out.contains("content") ? out : tool_result(out.dump(2), false));
-        } catch (const std::exception &e) {
-            return rpc_result(id, tool_result(e.what(), true));
-        }
+        return rpc_result(id, mcp_call_tool(name, args, running));
     }
     return rpc_error(id, -32601, "Method not found: " + method);
 }

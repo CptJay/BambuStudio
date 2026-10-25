@@ -1766,6 +1766,15 @@ void ToolbarAutoSizeRenderer::calculate_position(const GLToolbar& t_toolbar, con
 
         break;
     }
+    case ToolbarLayout::EPositionMode::TopRight:
+    {
+        float inv_zoom = (float)t_camera.get_inv_zoom();
+        const auto& t_viewport = t_camera.get_viewport();
+        top = 0.5f * (float)t_viewport[3] * inv_zoom;
+        left = (0.5f * (float)t_viewport[2] - t_toolbar.get_width()) * inv_zoom;
+
+        break;
+    }
     case ToolbarLayout::EPositionMode::Custom:
     default:
     {
@@ -2035,6 +2044,15 @@ void ToolbarKeepSizeRenderer::calculate_position(const GLToolbar& t_toolbar, con
             const float offset = (cnv_width - final_width) / 2.f;
             left += (offset + t_layout.offset) * inv_zoom;
         }
+
+        break;
+    }
+    case ToolbarLayout::EPositionMode::TopRight:
+    {
+        float inv_zoom = (float)t_camera.get_inv_zoom();
+        const auto& t_viewport = t_camera.get_viewport();
+        top = 0.5f * (float)t_viewport[3] * inv_zoom;
+        left = (0.5f * (float)t_viewport[2] - toolbar_width) * inv_zoom;
 
         break;
     }

@@ -430,6 +430,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/HttpServer.cpp
     GUI/McpServer.hpp
     GUI/McpServer.cpp
+    GUI/ChatPanel.hpp
+    GUI/ChatPanel.cpp
     Config/Snapshot.cpp
     Config/Snapshot.hpp
     Config/Version.cpp

@@ -477,6 +477,8 @@ public:
     void enable_sidebar(bool enabled);
     bool is_sidebar_collapsed() const;
     void collapse_sidebar(bool show);
+    bool is_chat_pane_shown() const;
+    void toggle_chat_pane();
     Sidebar::DockingState get_sidebar_docking_state() const;
     void                  reset_window_layout(int width = -1);
     // Called after the Preferences dialog is closed and the program settings are saved.
@@ -870,6 +872,7 @@ public:
 
     const GLToolbar& get_collapse_toolbar() const;
     GLToolbar& get_collapse_toolbar();
+    GLToolbar& get_chat_toolbar();
     int get_collapse_toolbar_size();
     void update_preview_bottom_toolbar();
     void update_preview_moves_slider();
