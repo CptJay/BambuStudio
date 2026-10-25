@@ -45,6 +45,8 @@
 #include "PartPlate.hpp"
 #include "Plater.hpp"
 #include "Jobs/Job.hpp"
+#include "Jobs/OrientJob.hpp"
+#include "libslic3r/Orient.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -706,6 +708,58 @@ static json undo(const json &, const std::atomic_bool &running)
     return result;
 }
 
+// The app's Orient, run directly: the OrientJob applies its result in a later UI event with no public "done" signal.
+// Runs on the UI thread, so the app pauses while it computes (about a second per complex part).
+static json orient(const json &args, const std::atomic_bool &running)
+{
+    const json names = args.value("names", json());
+    if (!names.is_null() && !(names.is_array() && !names.empty() &&
+                              std::all_of(names.begin(), names.end(), [](const json &n) { return n.is_string(); })))
+        throw std::invalid_argument("names must be a non-empty array of object names; leave it out to orient every object");
+
+    return run_on_ui_thread(running, [names] {
+        Plater                *plater  = wxGetApp().plater();
+        const ModelObjectPtrs &objects = plater->model().objects;
+        std::vector<size_t>    idxs;
+        if (names.is_null())
+            for (size_t i = 0; i < objects.size(); ++i)
+                idxs.push_back(i);
+        else
+            for (const json &name : names)
+                idxs.push_back(find_object(name.get<std::string>()));
+        // Each item rotates its object relative to where it is now, so a repeated name would rotate it twice.
+        std::sort(idxs.begin(), idxs.end());
+        idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+        if (idxs.empty())
+            throw std::runtime_error("The plate is empty");
+
+        orientation::OrientMeshs items;
+        for (size_t idx : idxs)
+            items.push_back(OrientJob::get_orient_mesh(objects[idx]->instances[0]));
+        // Same parameters as OrientJob::process(), including its copy of the "minimize support area" set.
+        orientation::OrientParams params;
+        if (plater->get_orient_min_area()) {
+            orientation::OrientParamsArea params_area;
+            memcpy(&params, &params_area, sizeof(params));
+            params.min_volume = false;
+        } else
+            params.min_volume = true;
+        params.progressind   = [](unsigned, std::string) {}; // called without a check
+        params.stopcondition = [] { return false; };
+        orientation::orient(items, {}, params);
+
+        Plater::TakeSnapshot snapshot(plater, "Orient");
+        for (const orientation::OrientMesh &item : items)
+            item.apply();
+        plater->update();
+
+        json result = json::array();
+        for (size_t idx : idxs)
+            result.push_back(object_json(idx));
+        return json{{"objects", result}};
+    });
+}
+
 static json arrange(const json &, const std::atomic_bool &running)
 {
     run_on_ui_thread(running, [] {
@@ -960,6 +1014,12 @@ static const std::vector<McpTool> &tools()
         {"undo", "Undo the last change to the plate (add, delete, move, text, object settings...), like Ctrl+Z. "
                  "Returns what was undone and the new scene. Preset and plate-wide setting changes are not undone.",
          NO_ARGS, undo},
+        {"orient",
+         "Lay objects on their best face for printing (fewest supports), like the app's Auto-orient. Without names, orients "
+         "every object. Rotating can change a part's footprint, so call arrange afterwards.",
+         {{"type", "object"},
+          {"properties", {{"names", {{"type", "array"}, {"items", {{"type", "string"}}}, {"description", "Objects to orient"}}}}}},
+         orient},
         {"arrange", "Arrange all objects on the plate and return the new scene.", NO_ARGS, arrange},
         {"slice", "Slice the current plate with the selected presets. Returns print time, filament use and the slicer's warnings "
                   "(e.g. floating regions, missing supports); if slicing fails, the error says why.",
