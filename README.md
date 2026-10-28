@@ -1,3 +1,6 @@
+> [!NOTE]
+> **This fork's work is on the [`feat/mcp-server`](https://github.com/CptJay/BambuStudio/tree/feat/mcp-server) branch:** an MCP server inside BambuStudio and a built-in AI chat pane, so a prompt can model, arrange and slice a part. `master` tracks upstream BambuStudio unchanged.
+
 ![image](https://user-images.githubusercontent.com/106916061/179006347-497d24c0-9bd6-45b7-8c49-d5cc8ecfe5d7.png)
 # BambuStudio
 Bambu Studio is a cutting-edge, feature-rich slicing software.  
