@@ -438,7 +438,8 @@ static json add_text(const json &args, const std::atomic_bool &running)
         // Find the surface height under the text by casting a ray down onto the object.
         const TriangleMesh         world_mesh = obj->mesh(); // AABBMesh keeps a pointer to it, so it must outlive the query
         const AABBMesh             surface(world_mesh);
-        const AABBMesh::hit_result hit = surface.query_ray_hit(Vec3d(xy.x(), xy.y(), bb.max.z() + 1.), -Vec3d::UnitZ());
+        // Nudge off the exact point: a ray down a mesh edge (e.g. the centre line of a cylinder's triangle fan) misses both triangles.
+        const AABBMesh::hit_result hit = surface.query_ray_hit(Vec3d(xy.x() + 1.3e-4, xy.y() + 0.7e-4, bb.max.z() + 1.), -Vec3d::UnitZ());
         if (!hit.is_hit())
             throw std::invalid_argument("position is not over the object");
         const double top = hit.position().z();
@@ -618,12 +619,33 @@ static json set_object_filament(const json &args, const std::atomic_bool &runnin
 {
     const std::string name     = args.value("name", "");
     const int         filament = args.value("filament", 0);
-    return run_on_ui_thread(running, [name, filament] {
+    const std::string part     = args.value("part", "");
+    return run_on_ui_thread(running, [name, filament, part] {
         const size_t count = wxGetApp().preset_bundle->filament_presets.size();
         if (filament < 1 || size_t(filament) > count)
             throw std::invalid_argument("filament must be a slot from 1 to " + std::to_string(count));
         const size_t idx  = find_object(name);
         ObjectList  *list = wxGetApp().obj_list();
+        if (!part.empty()) {
+            Plater                *plater  = wxGetApp().plater();
+            const ModelVolumePtrs &volumes = plater->model().objects[idx]->volumes;
+            auto it = std::find_if(volumes.begin(), volumes.end(), [&part](const ModelVolume *v) { return v->name == part && v->is_model_part(); });
+            if (it == volumes.end())
+                throw std::invalid_argument("No printable part named " + part + " in " + name);
+            // Set the part's config directly, as add_text does: selecting the part in the list does not stick (the 3D view
+            // reselects the whole object), so the list's "Change filament" action would recolor the whole object.
+            Plater::TakeSnapshot snapshot(plater, "Change Filaments");
+            (*it)->config.set_key_value("extruder", new ConfigOptionInt(filament));
+            // The object list orders parts its own way, so map the model's volume index to the list's for its filament column.
+            const int            ui_idx = list->GetModel()->get_real_volume_index_in_ui(int(idx), int(it - volumes.begin()));
+            const wxDataViewItem item   = list->GetModel()->GetItemByVolumeId(int(idx), ui_idx);
+            if (item.IsOk())
+                list->GetModel()->SetExtruder(wxString::Format("%d", filament), item);
+            plater->get_partplate_list().reset_thumbnail_assembly_view_data();
+            plater->update();
+            list->Refresh();
+            return object_json(idx);
+        }
         // The app's own "Change filament" action, which works on the object list's selection.
         list->select_item(list->GetModel()->GetItemById(int(idx)));
         list->set_extruder_for_selected_items(filament);
@@ -1088,9 +1110,12 @@ static const std::vector<McpTool> &tools()
          {{"type", "object"}, {"properties", {{"preset", {{"type", "string"}}}}}, {"required", json::array({"preset"})}},
          select_process_preset},
         {"set_object_filament",
-         "Print an object with a filament slot (1-based; see get_settings for the slots, their presets and colors).",
+         "Print an object, or one part of it (e.g. embossed text), with a filament slot (1-based; see get_settings for the slots, "
+         "their presets and colors).",
          {{"type", "object"},
-          {"properties", {{"name", {{"type", "string"}}}, {"filament", {{"type", "integer"}, {"description", "Filament slot, 1-based"}}}}},
+          {"properties", {{"name", {{"type", "string"}}},
+                          {"part", {{"type", "string"}, {"description", "Name of a part of the object, e.g. the text of add_text; default: the whole object"}}},
+                          {"filament", {{"type", "integer"}, {"description", "Filament slot, 1-based"}}}}},
           {"required", json::array({"name", "filament"})}},
          set_object_filament},
         {"select_filament",

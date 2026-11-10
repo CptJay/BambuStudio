@@ -66,8 +66,14 @@ def main():
         check(round(size(moved)[0]) == 20 and moved["instances"][0]["min"][2] == 0, "transform_object result")
         call("add_text", {"name": "smoke box", "text": "OK", "depth": 0.6})
         call("add_text", {"name": "smoke box", "text": "UP", "mode": "emboss", "position": [100, 85]})
+        call("set_object_filament", {"name": "smoke box", "part": "UP", "filament": 1})
+        call("set_object_filament", {"name": "smoke box", "part": "nope", "filament": 1}, expect_error=True)
         call("add_text", {"name": "smoke box", "text": "X", "font": "No Such Font 123"}, expect_error=True)
         call("duplicate_object", {"name": "smoke box", "copies": 1})
+        # The centre of a cylinder's top is a triangle-fan vertex; the ray used to miss there.
+        call("add_shape", {"shape": "cylinder", "size": [40, 40, 3], "name": "disc"})
+        call("add_text", {"name": "disc", "text": "C"})
+        call("delete_objects", {"names": ["disc"]})
         # Names stay unique, since every tool finds objects by name.
         call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "twin"})
         call("add_shape", {"shape": "box", "size": [5, 5, 5], "name": "twin"})
